@@ -71,16 +71,11 @@ type BinaryHandler = (audio: ArrayBuffer) => void
 type StatusHandler = (status: ConnectionStatus) => void
 type ErrorHandler = (error: unknown) => void
 
-const PING_INTERVAL_MS = 15_000
-const PONG_TIMEOUT_MS = 5_000
+const ICE_SERVERS: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }]
+
 const RECONNECT_BASE_DELAY_MS = 1_000
 const RECONNECT_MAX_DELAY_MS = 30_000
 const MAX_RECONNECT_ATTEMPTS = 10
-
-function resolveWebSocketUrl(): string {
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${protocol}//${window.location.host}/ws`
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
@@ -176,15 +171,16 @@ function isInboundMessage(value: unknown): value is InboundMessage {
   return false
 }
 
-export class WebSocketClient {
-  private socket: WebSocket | null = null
+export class WebRTCClient {
+  private pc: RTCPeerConnection | null = null
+  private dataChannel: RTCDataChannel | null = null
   private status: ConnectionStatus = 'disconnected'
-  private connectPromise: Promise<void> | null = null
+
+  // Active mic track — preserved across reconnects so it can be re-attached
+  private micTrack: MediaStreamTrack | null = null
+
   private reconnectAttempts = 0
   private reconnectEnabled = true
-
-  private pingIntervalId: number | null = null
-  private pongTimeoutId: number | null = null
   private reconnectTimeoutId: number | null = null
 
   private readonly messageHandlers = new Set<MessageHandler>()
@@ -192,128 +188,155 @@ export class WebSocketClient {
   private readonly statusHandlers = new Set<StatusHandler>()
   private readonly errorHandlers = new Set<ErrorHandler>()
 
-  connect(): Promise<void> {
-    if (this.socket?.readyState === WebSocket.OPEN) {
-      return Promise.resolve()
-    }
-
-    if (this.socket?.readyState === WebSocket.CONNECTING && this.connectPromise) {
-      return this.connectPromise
+  async connect(): Promise<void> {
+    if (this.status === 'connected' || this.status === 'connecting') {
+      return
     }
 
     this.reconnectEnabled = true
+    this.setStatus(this.reconnectAttempts > 0 ? 'reconnecting' : 'connecting')
 
-    this.connectPromise = new Promise<void>((resolve, reject) => {
-      let didOpen = false
-      let settled = false
+    try {
+      // Close any stale peer connection
+      this.pc?.close()
+      this.pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
 
-      const resolveConnect = () => {
-        if (settled) {
-          return
-        }
+      // Upstream audio transceiver (mic → server)
+      const transceiver = this.pc.addTransceiver('audio', { direction: 'sendonly' })
 
-        settled = true
-        resolve()
+      // If a live mic track exists from a previous session, re-attach it
+      if (this.micTrack && this.micTrack.readyState === 'live') {
+        await transceiver.sender.replaceTrack(this.micTrack)
       }
 
-      const rejectConnect = (error: unknown) => {
-        if (settled) {
-          return
-        }
+      // Downstream: DataChannel for TTS binary audio + JSON control messages
+      this.dataChannel = this.pc.createDataChannel('control', { ordered: true })
+      this.dataChannel.binaryType = 'arraybuffer'
 
-        settled = true
-        reject(error)
-      }
-
-      const ws = new WebSocket(resolveWebSocketUrl())
-      ws.binaryType = 'arraybuffer'
-
-      this.socket = ws
-      this.setStatus(this.reconnectAttempts > 0 ? 'reconnecting' : 'connecting')
-
-      ws.onopen = () => {
-        if (this.socket !== ws) {
-          return
-        }
-
-        didOpen = true
+      this.dataChannel.onopen = () => {
         this.reconnectAttempts = 0
-        this.stopReconnectTimer()
         this.setStatus('connected')
-        this.startHeartbeat()
-        resolveConnect()
       }
 
-      ws.onclose = (event) => {
-        if (this.socket === ws) {
-          this.socket = null
-        }
-
-        this.stopHeartbeat()
-
-        const shouldRetry = this.reconnectEnabled && event.code !== 1000
-        if (shouldRetry) {
+      this.dataChannel.onclose = () => {
+        if (this.reconnectEnabled && this.status !== 'disconnected') {
           this.scheduleReconnect()
-        } else {
-          this.stopReconnectTimer()
-          this.setStatus('disconnected')
-        }
-
-        if (!didOpen) {
-          rejectConnect(new Error('WebSocket connection closed before opening'))
         }
       }
 
-      ws.onerror = () => {
-        const error = new Error('WebSocket connection error')
-        this.emitError(error)
-
-        if (!didOpen) {
-          rejectConnect(error)
+      this.dataChannel.onmessage = (event) => {
+        if (event.data instanceof ArrayBuffer) {
+          // Binary: PCM16 TTS audio chunk
+          for (const h of this.binaryHandlers) h(event.data)
+        } else if (typeof event.data === 'string') {
+          // Text: JSON control message
+          let parsed: unknown
+          try {
+            parsed = JSON.parse(event.data)
+          } catch {
+            return
+          }
+          if (isInboundMessage(parsed)) {
+            for (const h of this.messageHandlers) h(parsed)
+          }
         }
       }
 
-      ws.onmessage = (event) => {
-        void this.handleMessageEvent(event)
+      this.pc.oniceconnectionstatechange = () => {
+        if (this.pc?.iceConnectionState === 'failed') {
+          this.scheduleReconnect()
+        }
       }
-    }).finally(() => {
-      this.connectPromise = null
-    })
 
-    return this.connectPromise
+      // Create offer, wait for ICE gathering to complete (vanilla ICE)
+      const offer = await this.pc.createOffer()
+      await this.pc.setLocalDescription(offer)
+      await this.waitForIceGathering()
+
+      // POST offer SDP to signaling endpoint
+      const response = await fetch('/webrtc/offer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sdp: this.pc.localDescription!.sdp,
+          type: this.pc.localDescription!.type,
+        }),
+      })
+
+      if (!response.ok) {
+        throw new Error(`Signaling failed: ${response.status}`)
+      }
+
+      const answer = (await response.json()) as { sdp: string; type: string }
+      await this.pc.setRemoteDescription(new RTCSessionDescription(answer))
+      // DataChannel.onopen fires once DTLS handshake completes → status → 'connected'
+    } catch (error) {
+      this.emitError(error)
+      this.scheduleReconnect()
+    }
   }
 
-  disconnect(code = 1000, reason = 'Client disconnect'): void {
+  disconnect(): void {
     this.reconnectEnabled = false
     this.reconnectAttempts = 0
-
     this.stopReconnectTimer()
-    this.stopHeartbeat()
-
-    if (this.socket) {
-      this.socket.close(code, reason)
-      this.socket = null
-    }
-
+    this.pc?.close()
+    this.pc = null
+    this.dataChannel = null
     this.setStatus('disconnected')
   }
 
   send(message: OutboundMessage): boolean {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+    if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
       return false
     }
 
-    this.socket.send(JSON.stringify(message))
+    this.dataChannel.send(JSON.stringify(message))
     return true
   }
 
-  sendBinary(data: ArrayBuffer): boolean {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-      return false
+  /**
+   * Request microphone access, attach the track to the peer connection, and
+   * return the live MediaStreamTrack for the caller to manage (mute/stop).
+   */
+  async enableMicrophone(): Promise<MediaStreamTrack> {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        sampleRate: 48000,
+      },
+    })
+
+    const [track] = stream.getAudioTracks()
+    this.micTrack = track
+
+    const sender = this.pc?.getSenders().find(
+      (s) => s.track?.kind === 'audio' || s.track === null
+    )
+    if (sender) {
+      await sender.replaceTrack(track)
     }
 
-    this.socket.send(data)
-    return true
+    return track
+  }
+
+  /**
+   * Stop the microphone track and detach it from the peer connection.
+   */
+  disableMicrophone(track: MediaStreamTrack): void {
+    track.stop()
+
+    if (this.micTrack === track) {
+      this.micTrack = null
+    }
+
+    const sender = this.pc?.getSenders().find((s) => s.track === track)
+    if (sender) {
+      void sender.replaceTrack(null)
+    }
   }
 
   getStatus(): ConnectionStatus {
@@ -349,7 +372,7 @@ export class WebSocketClient {
   }
 
   private scheduleReconnect(): void {
-    if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+    if (!this.reconnectEnabled || this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
       this.setStatus('disconnected')
       return
     }
@@ -365,50 +388,10 @@ export class WebSocketClient {
 
     this.reconnectTimeoutId = window.setTimeout(() => {
       this.reconnectTimeoutId = null
-
-      if (!this.reconnectEnabled) {
-        return
+      if (this.reconnectEnabled) {
+        void this.connect().catch((error: unknown) => this.emitError(error))
       }
-
-      void this.connect().catch((error: unknown) => {
-        this.emitError(error)
-      })
     }, delay)
-  }
-
-  private startHeartbeat(): void {
-    this.stopHeartbeat()
-
-    this.pingIntervalId = window.setInterval(() => {
-      const pingSent = this.send({ type: 'ping' })
-      if (!pingSent) {
-        return
-      }
-
-      if (this.pongTimeoutId !== null) {
-        window.clearTimeout(this.pongTimeoutId)
-      }
-
-      this.pongTimeoutId = window.setTimeout(() => {
-        this.pongTimeoutId = null
-
-        if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-          this.socket.close(4000, 'Pong timeout')
-        }
-      }, PONG_TIMEOUT_MS)
-    }, PING_INTERVAL_MS)
-  }
-
-  private stopHeartbeat(): void {
-    if (this.pingIntervalId !== null) {
-      window.clearInterval(this.pingIntervalId)
-      this.pingIntervalId = null
-    }
-
-    if (this.pongTimeoutId !== null) {
-      window.clearTimeout(this.pongTimeoutId)
-      this.pongTimeoutId = null
-    }
   }
 
   private stopReconnectTimer(): void {
@@ -418,49 +401,30 @@ export class WebSocketClient {
     }
   }
 
-  private handlePong(): void {
-    if (this.pongTimeoutId !== null) {
-      window.clearTimeout(this.pongTimeoutId)
-      this.pongTimeoutId = null
-    }
-  }
+  private waitForIceGathering(): Promise<void> {
+    return new Promise<void>((resolve) => {
+      if (this.pc?.iceGatheringState === 'complete') {
+        resolve()
+        return
+      }
 
-  private async handleMessageEvent(event: MessageEvent): Promise<void> {
-    if (event.data instanceof ArrayBuffer) {
-      this.emitBinary(event.data)
-      return
-    }
+      let resolved = false
+      const tryResolve = () => {
+        if (!resolved) {
+          resolved = true
+          resolve()
+        }
+      }
 
-    if (event.data instanceof Blob) {
-      const buffer = await event.data.arrayBuffer()
-      this.emitBinary(buffer)
-      return
-    }
+      this.pc!.addEventListener('icegatheringstatechange', () => {
+        if (this.pc?.iceGatheringState === 'complete') tryResolve()
+      })
 
-    if (typeof event.data !== 'string') {
-      this.emitError(new Error('Received unsupported WebSocket message type'))
-      return
-    }
-
-    let parsed: unknown
-    try {
-      parsed = JSON.parse(event.data)
-    } catch (error) {
-      this.emitError(error)
-      return
-    }
-
-    if (!isInboundMessage(parsed)) {
-      this.emitError(new Error('Received malformed WebSocket message'))
-      return
-    }
-
-    if (parsed.type === 'pong') {
-      this.handlePong()
-      return
-    }
-
-    this.emitMessage(parsed)
+      // Null candidate is the sentinel that ICE gathering is complete
+      this.pc!.addEventListener('icecandidate', (e: RTCPeerConnectionIceEvent) => {
+        if (e.candidate === null) tryResolve()
+      })
+    })
   }
 
   private setStatus(nextStatus: ConnectionStatus): void {
@@ -471,18 +435,6 @@ export class WebSocketClient {
     this.status = nextStatus
     for (const handler of this.statusHandlers) {
       handler(nextStatus)
-    }
-  }
-
-  private emitMessage(message: InboundMessage): void {
-    for (const handler of this.messageHandlers) {
-      handler(message)
-    }
-  }
-
-  private emitBinary(audio: ArrayBuffer): void {
-    for (const handler of this.binaryHandlers) {
-      handler(audio)
     }
   }
 
