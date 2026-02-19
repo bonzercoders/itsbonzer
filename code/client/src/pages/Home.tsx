@@ -44,12 +44,13 @@ import {
 } from '@/lib/openrouter-models'
 import { cn } from '@/lib/utils'
 import {
-  WebRTCClient,
+  WebSocketClient,
   type ConnectionStatus,
   type InboundMessage,
   type ModelSettingsMessage,
 } from '@/lib/websocket'
 import { AudioPlayer } from '@/lib/audioPlayer'
+import { STTAudioCapture } from '@/lib/sttAudioCapture'
 
 type ToolbarButtonProps = {
   label: string
@@ -414,20 +415,25 @@ function HomePage() {
   const streamingMessageIdRef = useRef<string | null>(null)
   const liveSttMessageIdRef = useRef<string | null>(null)
   const microphoneStateRef = useRef<MicrophoneState>('off')
-  const websocketClientRef = useRef<WebRTCClient | null>(null)
+  const websocketClientRef = useRef<WebSocketClient | null>(null)
   const audioPlayerRef = useRef<AudioPlayer | null>(null)
-  const micTrackRef = useRef<MediaStreamTrack | null>(null)
+  const sttAudioCaptureRef = useRef<STTAudioCapture | null>(null)
   const modelSettingsRef = useRef<ModelSettingsMessage>(
     mapModelSettingsMessage(DEFAULT_MODEL_ID, defaultModelParameterValues)
   )
   const drawerWidth = 420
 
   if (websocketClientRef.current === null) {
-    websocketClientRef.current = new WebRTCClient()
+    websocketClientRef.current = new WebSocketClient()
   }
 
   if (audioPlayerRef.current === null) {
     audioPlayerRef.current = new AudioPlayer()
+  }
+  if (sttAudioCaptureRef.current === null) {
+    sttAudioCaptureRef.current = new STTAudioCapture({
+      sendBinary: (data) => websocketClientRef.current?.sendBinary(data) ?? false,
+    })
   }
 
   useEffect(() => {
@@ -677,12 +683,10 @@ function HomePage() {
     } else if (message.type === 'stt_final') {
       finalizeLiveSttMessage(message.text)
     } else if (message.type === 'audio_stream_start') {
-      // Mute the mic track so the server's STT doesn't receive audio during playback
-      if (micTrackRef.current) micTrackRef.current.enabled = false
+      sttAudioCaptureRef.current?.setPausedForPlayback(true)
       audioPlayerRef.current?.handleStreamStart(message.data)
     } else if (message.type === 'audio_stream_stop') {
-      // Unmute the mic track so the server's STT resumes receiving audio
-      if (micTrackRef.current) micTrackRef.current.enabled = true
+      sttAudioCaptureRef.current?.setPausedForPlayback(false)
       audioPlayerRef.current?.handleStreamStop(message.data)
     }
   }, [finalizeLiveSttMessage, upsertLiveSttMessage])
@@ -707,6 +711,8 @@ function HomePage() {
 
       // Finalize any in-flight streaming message on disconnect
       if (status === 'disconnected' || status === 'reconnecting') {
+        sttAudioCaptureRef.current?.setPausedForPlayback(false)
+
         const activeId = streamingMessageIdRef.current
         if (activeId) {
           streamingMessageIdRef.current = null
@@ -741,11 +747,10 @@ function HomePage() {
     return () => {
       if (microphoneStateRef.current === 'on') {
         websocketClient.send({ type: 'stop_listening' })
-        if (micTrackRef.current) {
-          websocketClient.disableMicrophone(micTrackRef.current)
-          micTrackRef.current = null
-        }
       }
+      sttAudioCaptureRef.current?.disable()
+      void sttAudioCaptureRef.current?.destroy()
+      sttAudioCaptureRef.current = null
 
       unsubscribeStatus()
       unsubscribeMessage()
@@ -758,9 +763,10 @@ function HomePage() {
   }, [handleWebSocketMessage, sealLiveSttMessage])
 
   const toggleMicrophone = useCallback(async () => {
-    const webrtcClient = websocketClientRef.current
+    const websocketClient = websocketClientRef.current
+    const sttAudioCapture = sttAudioCaptureRef.current
 
-    if (!webrtcClient) {
+    if (!websocketClient || !sttAudioCapture) {
       return
     }
 
@@ -769,42 +775,38 @@ function HomePage() {
     }
 
     if (microphoneStateRef.current === 'on') {
-      webrtcClient.send({ type: 'stop_listening' })
-      if (micTrackRef.current) {
-        webrtcClient.disableMicrophone(micTrackRef.current)
-        micTrackRef.current = null
-      }
+      websocketClient.send({ type: 'stop_listening' })
+      sttAudioCapture.disable()
       setMicrophoneState('off')
       sealLiveSttMessage()
       return
     }
 
-    if (webrtcClient.getStatus() !== 'connected') {
+    if (websocketClient.getStatus() !== 'connected') {
       setMicrophoneState('error')
-      console.error('[STT] Cannot start microphone while WebRTC is disconnected')
+      console.error('[STT] Cannot start microphone while websocket is disconnected')
       return
     }
 
     setMicrophoneState('enabling')
 
-    try {
-      const track = await webrtcClient.enableMicrophone()
-      micTrackRef.current = track
-
-      const started = webrtcClient.send({ type: 'start_listening' })
-      if (!started) {
-        webrtcClient.disableMicrophone(track)
-        micTrackRef.current = null
-        setMicrophoneState('error')
-        console.error('[STT] Failed to send start_listening command')
-        return
-      }
-
-      setMicrophoneState('on')
-    } catch (err) {
+    const enabled = await sttAudioCapture.enable()
+    if (!enabled) {
       setMicrophoneState('error')
-      console.error('[STT] Failed to enable microphone', err)
+      console.error('[STT] Failed to enable audio capture', sttAudioCapture.getState())
+      return
     }
+
+    const started = websocketClient.send({ type: 'start_listening' })
+    if (!started) {
+      sttAudioCapture.disable()
+      setMicrophoneState('error')
+      console.error('[STT] Failed to send start_listening command')
+      return
+    }
+
+    sttAudioCapture.setPausedForPlayback(false)
+    setMicrophoneState('on')
   }, [sealLiveSttMessage])
 
   const sendUserMessage = () => {
