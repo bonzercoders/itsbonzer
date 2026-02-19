@@ -21,7 +21,7 @@ Single-user application. Do not over-engineer for enterprise scale or multi-tena
   - Producer/consumer with `asyncio.Queue`
   - `asyncio.create_task()` with `Queue.task_done()`
 
-## File Structure (current)
+## File Structure (update)
 
 Code
 ├── backend
