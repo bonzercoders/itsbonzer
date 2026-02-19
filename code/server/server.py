@@ -44,7 +44,6 @@ logger.setLevel(logging.INFO)
 ##--          Data Classes          --##
 ########################################
 
-# Character Models
 class Character(BaseModel):
     id: str
     name: str
@@ -57,7 +56,6 @@ class Character(BaseModel):
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
-# Voice Models
 class Voice(BaseModel):
     voice_id: str           # Primary key
     voice_name: str         # Display name (human-readable)
