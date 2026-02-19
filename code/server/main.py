@@ -12,8 +12,6 @@ import uvicorn
 import asyncio
 import aiohttp
 import logging
-from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
-from scipy.signal import resample_poly
 import threading
 import numpy as np
 import multiprocessing
@@ -29,7 +27,7 @@ from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional, Dict, List, Union, Any, AsyncIterator, AsyncGenerator, Awaitable, Set, Tuple
 from backend.RealtimeSTT import AudioToTextRecorder
@@ -46,6 +44,7 @@ logger.setLevel(logging.INFO)
 ##--          Data Classes          --##
 ########################################
 
+# Character Models
 class Character(BaseModel):
     id: str
     name: str
@@ -58,6 +57,7 @@ class Character(BaseModel):
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
+# Voice Models
 class Voice(BaseModel):
     voice_id: str           # Primary key
     voice_name: str         # Display name (human-readable)
@@ -845,16 +845,15 @@ class TTS:
         self._initialized = False
 
 ########################################
-##--         WebRTC Manager         --##
+##--        WebSocket Manager       --##
 ########################################
 
-class WebRTCManager:
-    """Manages a single WebRTC peer connection and routes messages via DataChannel."""
+class WebSocketManager:
+    """Manages WebSocket connection and routes messages."""
 
     def __init__(self):
         self.queues = PipeQueues()
-        self.pc: Optional[RTCPeerConnection] = None
-        self.data_channel = None          # RTCDataChannel, opened by the client
+        self.websocket: Optional[WebSocket] = None
         self.stt: Optional[STT] = None
         self.chat: Optional[ChatLLM] = None
         self.tts: Optional[TTS] = None
@@ -863,6 +862,7 @@ class WebRTCManager:
         self._task_tts_worker: Optional[asyncio.Task] = None
         self._task_stream_audio: Optional[asyncio.Task] = None
 
+        self.user_name = "Jay"
         self.stream_start_time: Optional[float] = None
 
     async def initialize(self):
@@ -889,108 +889,28 @@ class WebRTCManager:
 
         logger.info(f"Initialized with {len(self.chat.active_characters)} active characters")
 
-    async def handle_offer(self, sdp: str, sdp_type: str) -> dict:
-        """Process client SDP offer and return answer SDP. Called from HTTP endpoint."""
+    async def connect(self, websocket: WebSocket):
+        """Accept WebSocket connection, start pipeline + audio streamer."""
 
-        # Close any previous peer connection cleanly (single-user reconnect case)
-        if self.pc is not None:
-            await self.pc.close()
-            self.pc = None
-            self.data_channel = None
-
-        self.pc = RTCPeerConnection()
-
-        @self.pc.on("datachannel")
-        def on_datachannel(channel):
-            self.data_channel = channel
-
-            @channel.on("message")
-            def on_message(message):
-                asyncio.ensure_future(self.handle_text_message(message))
-
-        @self.pc.on("track")
-        def on_track(track):
-            if track.kind == "audio":
-                asyncio.ensure_future(self._consume_audio_track(track))
-
-        offer = RTCSessionDescription(sdp=sdp, type=sdp_type)
-        await self.pc.setRemoteDescription(offer)
-
-        answer = await self.pc.createAnswer()
-        await self.pc.setLocalDescription(answer)
-
-        # Vanilla ICE: wait until all candidates are gathered before returning
-        await self._wait_for_ice_gathering()
+        await websocket.accept()
+        self.websocket = websocket
 
         await self._conversation_tasks()
 
-        logger.info("WebRTC peer connection established")
-        return {
-            "sdp": self.pc.localDescription.sdp,
-            "type": self.pc.localDescription.type,
-        }
+        logger.info("WebSocket connected")
 
-    async def _wait_for_ice_gathering(self):
-        """Block until ICE gathering state reaches 'complete'."""
-        if self.pc.iceGatheringState == "complete":
-            return
-
-        loop = asyncio.get_event_loop()
-        gathered = loop.create_future()
-
-        @self.pc.on("icegatheringstatechange")
-        def on_ice_state_change():
-            if self.pc.iceGatheringState == "complete" and not gathered.done():
-                gathered.set_result(None)
-
-        try:
-            await asyncio.wait_for(gathered, timeout=10.0)
-        except asyncio.TimeoutError:
-            logger.warning("ICE gathering timed out, proceeding with available candidates")
-
-    async def _consume_audio_track(self, track: MediaStreamTrack):
-        """Drain audio frames from the WebRTC track, resample, and feed to STT.
-
-        The browser sends Opus-encoded audio at 48 kHz. aiortc decodes it to
-        PCM AudioFrames which we downsample to 16 kHz before feeding RealtimeSTT.
-        """
-        while True:
-            try:
-                frame = await track.recv()
-            except Exception:
-                break  # track ended or connection closed
-
-            # frame.to_ndarray() → shape (channels, samples)
-            # format is typically fltp (float planar) or s16/s16p from Opus decode
-            pcm = frame.to_ndarray()
-
-            # Mono mix
-            if pcm.shape[0] > 1:
-                pcm_mono = pcm.mean(axis=0)
-            else:
-                pcm_mono = pcm[0]
-
-            # Normalise to int16 (handle both float and integer frame formats)
-            if pcm_mono.dtype.kind == 'f':
-                pcm_int16 = np.clip(pcm_mono * 32768, -32768, 32767).astype(np.int16)
-            else:
-                pcm_int16 = pcm_mono.astype(np.int16)
-
-            # Downsample 48 kHz → 16 kHz (exact 1:3 ratio via polyphase filter)
-            pcm_16k = resample_poly(pcm_int16.astype(np.float32), up=1, down=3)
-            pcm_bytes = np.clip(pcm_16k, -32768, 32767).astype(np.int16).tobytes()
-
-            if self.stt:
-                self.stt.feed_audio(pcm_bytes)
-
-    async def shutdown(self):
-        """Stop STT and close peer connection on app shutdown."""
+    async def disconnect(self):
+        """Stop everything cleanly on WebSocket close."""
         if self.stt:
             self.stt.stop_listening()
-        if self.pc:
-            await self.pc.close()
+
+        self.websocket = None
+
+    async def shutdown(self):
+        await self.disconnect()
 
     async def _conversation_tasks(self) -> None:
+
         if self._task_user_message is None or self._task_user_message.done():
             self._task_user_message = asyncio.create_task(self.chat.get_user_message())
 
@@ -1001,7 +921,7 @@ class WebRTCManager:
             self._task_stream_audio = asyncio.create_task(self.stream_audio())
 
     async def stream_audio(self) -> None:
-        """Long-running consumer: pull TTS audio chunks and send to client via DataChannel."""
+        """Long-running consumer: pull audio chunks from tts_queue and stream to client."""
 
         active_stream_chunk: Optional[AudioChunk] = None
 
@@ -1009,6 +929,7 @@ class WebRTCManager:
             while True:
                 item = await self.queues.tts_queue.get()
                 try:
+                    # Typed sentinel — this character's audio is done
                     if isinstance(item, AudioResponseDone):
                         if active_stream_chunk:
                             await self.on_audio_stream_stop(active_stream_chunk)
@@ -1022,8 +943,8 @@ class WebRTCManager:
 
                     active_stream_chunk = chunk
 
-                    if self.data_channel and self.data_channel.readyState == "open":
-                        self.data_channel.send(chunk.audio_bytes)
+                    if self.websocket:
+                        await self.websocket.send_bytes(chunk.audio_bytes)
                 finally:
                     self.queues.tts_queue.task_done()
 
@@ -1031,7 +952,7 @@ class WebRTCManager:
             logger.debug("[Transport] Audio streamer cancelled")
 
     async def refresh_active_characters(self):
-        """Refresh active characters from database."""
+        """Refresh active characters from database (call when characters change)"""
         if self.chat:
             self.chat.active_characters = await self.chat.get_active_characters()
             logger.info(f"Refreshed to {len(self.chat.active_characters)} active characters")
@@ -1054,6 +975,7 @@ class WebRTCManager:
                                         "data": {"character_id": character.id, "character_name": character.name, "message_id": message_id}})
 
     async def on_text_chunk(self, text: str, character: Character, message_id: str):
+        """Forward a single LLM text chunk to the client."""
         await self.send_text_to_client({"type": "text_chunk",
                                         "data": {"text": text, "character_id": character.id, "character_name": character.name, "message_id": message_id}})
 
@@ -1074,14 +996,14 @@ class WebRTCManager:
         await self.send_text_to_client({"type": "audio_stream_stop",
                                         "data": {"character_id": chunk.character_id, "character_name": chunk.character_name, "message_id": chunk.message_id}})
 
-    # ------ DataChannel message handling ------ #
+    # ------ WebSocket message handling ------ #
 
     async def handle_text_message(self, raw: str):
-        """Parse incoming JSON text message from DataChannel and route to handler."""
+        """Parse incoming JSON text message and route to handler."""
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            logger.warning(f"Received non-JSON message: {raw[:100]}")
+            logger.warning(f"Received non-JSON text message: {raw[:100]}")
             return
 
         message_type = data.get("type", "")
@@ -1127,31 +1049,36 @@ class WebRTCManager:
         else:
             logger.warning(f"Unknown message type: {message_type}")
 
+    async def handle_audio_message(self, audio_bytes: bytes):
+        """Feed audio for transcription."""
+        if self.stt:
+            self.stt.feed_audio(audio_bytes)
+
     async def handle_user_message(self, user_message: str):
-        """Process a typed user message (not from STT)."""
+        """Process manually sent user message (typed, not from STT)."""
         self.stream_start_time = time.time()
         await self.queues.stt_queue.put(user_message)
 
     async def send_text_to_client(self, data: dict):
-        """Send JSON control message to client via DataChannel."""
-        if self.data_channel and self.data_channel.readyState == "open":
-            self.data_channel.send(json.dumps(data))
+        """Send JSON message to client."""
+        if self.websocket:
+            await self.websocket.send_text(json.dumps(data))
 
 ########################################
 ##--           FastAPI App          --##
 ########################################
 
-webrtc_manager = WebRTCManager()
+ws_manager = WebSocketManager()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("Starting up services...")
-    await webrtc_manager.initialize()
+    await ws_manager.initialize()
 
     print("All services initialised!")
     yield
     print("Shutting down services...")
-    await webrtc_manager.shutdown()
+    await ws_manager.shutdown()
     print("All services shut down!")
 
 app = FastAPI(lifespan=lifespan)
@@ -1165,17 +1092,29 @@ app.add_middleware(
 )
 
 ########################################
-##--        WebRTC Signaling        --##
+##--       WebSocket Endpoint       --##
 ########################################
 
-class WebRTCOffer(BaseModel):
-    sdp: str
-    type: str
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await ws_manager.connect(websocket)
 
-@app.post("/webrtc/offer")
-async def webrtc_offer(offer: WebRTCOffer):
-    """Signaling endpoint: receive client SDP offer, return server SDP answer."""
-    return await webrtc_manager.handle_offer(sdp=offer.sdp, sdp_type=offer.type)
+    try:
+        while True:
+            message = await websocket.receive()
+
+            if "text" in message:
+                await ws_manager.handle_text_message(message["text"])
+
+            elif "bytes" in message:
+                await ws_manager.handle_audio_message(message["bytes"])
+
+    except WebSocketDisconnect:
+        await ws_manager.disconnect()
+
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        await ws_manager.disconnect()
 
 ########################################
 ##--           Run Server           --##
