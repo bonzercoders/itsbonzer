@@ -30,11 +30,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional, Dict, List, Union, Any, AsyncIterator, AsyncGenerator, Awaitable, Set, Tuple
-from backend.RealtimeSTT import AudioToTextRecorder
-from backend.stream2sentence import generate_sentences_async
-from backend.boson_multimodal.serve.serve_engine import HiggsAudioServeEngine
-from backend.boson_multimodal.data_types import ChatMLSample, Message, AudioContent, TextContent
-from backend.boson_multimodal.model.higgs_audio.utils import revert_delay_pattern
+from server.database_director import db, Character, Voice, Conversation, MessageCreate
+from server.RealtimeSTT import AudioToTextRecorder
+from server.stream2sentence import generate_sentences_async
+from server.boson_multimodal.serve.serve_engine import HiggsAudioServeEngine
+from server.boson_multimodal.data_types import ChatMLSample, Message, AudioContent, TextContent
+from server.boson_multimodal.model.higgs_audio.utils import revert_delay_pattern
 
 logging.basicConfig(filename="filelogger.log", format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -43,32 +44,6 @@ logger.setLevel(logging.INFO)
 ########################################
 ##--          Data Classes          --##
 ########################################
-
-# Character Models
-class Character(BaseModel):
-    id: str
-    name: str
-    voice_id: str = ""
-    global_roleplay: str = ""
-    system_prompt: str = ""
-    image_url: str = ""
-    images: List[str] = []
-    is_active: bool = False
-    created_at: Optional[str] = None
-    updated_at: Optional[str] = None
-
-# Voice Models
-class Voice(BaseModel):
-    voice_id: str           # Primary key
-    voice_name: str         # Display name (human-readable)
-    method: str = ""
-    ref_audio: str = ""
-    ref_text: str = ""
-    speaker_desc: str = ""
-    scene_prompt: str = ""
-    audio_ids: Optional[Any] = None
-    created_at: Optional[str] = None
-    updated_at: Optional[str] = None
 
 @dataclass
 class CharacterResponse:
@@ -1073,10 +1048,17 @@ ws_manager = WebSocketManager()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("Starting up services...")
+
+    await db.init_database()
     await ws_manager.initialize()
 
+    db.on_characters_changed = ws_manager.refresh_active_characters
+    await db.subscribe_to_broadcasts()
+
     print("All services initialised!")
+
     yield
+
     print("Shutting down services...")
     await ws_manager.shutdown()
     print("All services shut down!")
