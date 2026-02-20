@@ -233,7 +233,7 @@ class STT:
         if callback is None or self.loop is None:
             return
 
-        if asyncio.iscoroutinefunction(callback):
+        if asyncio.inspect.iscoroutinefunction(callback):
             asyncio.run_coroutine_threadsafe(callback(*args), self.loop)
         else:
             self.loop.call_soon_threadsafe(callback, *args)
