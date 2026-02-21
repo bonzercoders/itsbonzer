@@ -30,7 +30,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional, Dict, List, Union, Any, AsyncIterator, AsyncGenerator, Awaitable, Set, Tuple
-from server.database_director import db, Character, Voice, Conversation, MessageCreate
+from server.database import db, Character, Voice, Conversation, MessageCreate
 from server.RealtimeSTT import AudioToTextRecorder
 from server.stream2sentence import generate_sentences_async
 from server.boson_multimodal.serve.serve_engine import HiggsAudioServeEngine

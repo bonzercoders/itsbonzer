@@ -1,5 +1,5 @@
 """
-Database Director Module
+Database Module
 Centralized database operations for Characters, Voices, Conversations, and Messages
 using Supabase as the backend.
 """
@@ -39,7 +39,6 @@ class Character(BaseModel):
     image_url: str = ""
     images: List[str] = []
     is_active: bool = False
-    last_message: str = ""
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
@@ -62,7 +61,6 @@ class CharacterUpdate(BaseModel):
     image_url: Optional[str] = None
     images: Optional[List[str]] = None
     is_active: Optional[bool] = None
-    last_message: Optional[str] = None
 
 
 # Voice Models
@@ -139,10 +137,10 @@ class MessageCreate(BaseModel):
 
 
 ########################################
-##--       Database Director        --##
+##--            Database            --##
 ########################################
 
-class DatabaseDirector:
+class Database:
     """
     Centralized database management for all Supabase operations.
     Handles Characters, Voices, Conversations, and Messages.
@@ -234,7 +232,7 @@ class DatabaseDirector:
             return
 
         task = loop.create_task(coro)
-        task.add_done_callback(DatabaseDirector._log_task_exception)
+        task.add_done_callback(Database._log_task_exception)
 
     @staticmethod
     def _log_task_exception(task: asyncio.Task) -> None:
@@ -310,7 +308,6 @@ class DatabaseDirector:
                     "image_url": row.get("image_url") or "",
                     "images": row.get("images") or [],
                     "is_active": row.get("is_active") or False,
-                    "last_message": row.get("last_message") or "",
                     "created_at": row.get("created_at"),
                     "updated_at": row.get("updated_at")
                 }
@@ -342,7 +339,6 @@ class DatabaseDirector:
                     "image_url": row.get("image_url") or "",
                     "images": row.get("images") or [],
                     "is_active": row.get("is_active") or False,
-                    "last_message": row.get("last_message") or "",
                     "created_at": row.get("created_at"),
                     "updated_at": row.get("updated_at")
                 }
@@ -376,7 +372,6 @@ class DatabaseDirector:
                 "image_url": row.get("image_url") or "",
                 "images": row.get("images") or [],
                 "is_active": row.get("is_active") or False,
-                "last_message": row.get("last_message") or "",
                 "created_at": row.get("created_at"),
                 "updated_at": row.get("updated_at")
             }
@@ -438,8 +433,6 @@ class DatabaseDirector:
                 update_data["images"] = character_data.images
             if character_data.is_active is not None:
                 update_data["is_active"] = character_data.is_active
-            if character_data.last_message is not None:
-                update_data["last_message"] = character_data.last_message
 
             if not update_data:
                 raise HTTPException(status_code=400, detail="No fields to update")
@@ -504,7 +497,6 @@ class DatabaseDirector:
                     "image_url": row.get("image_url") or "",
                     "images": row.get("images") or [],
                     "is_active": row.get("is_active") or False,
-                    "last_message": row.get("last_message") or "",
                     "created_at": row.get("created_at"),
                     "updated_at": row.get("updated_at")
                 }
@@ -1249,4 +1241,4 @@ class DatabaseDirector:
 ########################################
 
 # Create a default instance for easy importing
-db = DatabaseDirector()
+db = Database()
