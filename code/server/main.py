@@ -382,7 +382,7 @@ class ChatLLM:
         """
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filename = f"conversation_context_{timestamp}.json"
-        filepath = os.path.join("backend", filename)
+        filepath = os.path.join("server", filename)
 
         # Build the full request payload for inspection
         context_data = {
