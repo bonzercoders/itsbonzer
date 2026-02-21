@@ -4,6 +4,8 @@ export type ConnectionStatus =
   | 'connected'
   | 'reconnecting'
 
+export type STTState = 'inactive' | 'listening' | 'recording' | 'transcribing'
+
 export type ModelSettingsMessage = {
   type: 'model_settings'
   model: string
@@ -30,6 +32,8 @@ export type InboundMessage =
   | { type: 'stt_update'; text: string }
   | { type: 'stt_stabilized'; text: string }
   | { type: 'stt_final'; text: string }
+  | { type: 'stt_state'; data: { state: STTState } }
+  | { type: 'tts_interrupted'; data: { reason: 'barge_in'; message_id?: string } }
   | {
       type: 'text_stream_start'
       data: { character_id: string; character_name: string; message_id: string }
@@ -50,6 +54,7 @@ export type InboundMessage =
         character_name: string
         message_id: string
         text: string
+        interrupted?: boolean
       }
     }
   | {
@@ -130,6 +135,26 @@ function isInboundMessage(value: unknown): value is InboundMessage {
     return true
   }
 
+  if (
+    value.type === 'stt_state' &&
+    isRecord(value.data) &&
+    (value.data.state === 'inactive' ||
+      value.data.state === 'listening' ||
+      value.data.state === 'recording' ||
+      value.data.state === 'transcribing')
+  ) {
+    return true
+  }
+
+  if (
+    value.type === 'tts_interrupted' &&
+    isRecord(value.data) &&
+    value.data.reason === 'barge_in' &&
+    (value.data.message_id === undefined || typeof value.data.message_id === 'string')
+  ) {
+    return true
+  }
+
   if (!isTextMessageWithData(value) && !isAudioMessageWithData(value)) {
     return false
   }
@@ -158,7 +183,9 @@ function isInboundMessage(value: unknown): value is InboundMessage {
     typeof value.data.text === 'string' &&
     typeof value.data.character_id === 'string' &&
     typeof value.data.character_name === 'string' &&
-    typeof value.data.message_id === 'string'
+    typeof value.data.message_id === 'string' &&
+    (value.data.interrupted === undefined ||
+      typeof value.data.interrupted === 'boolean')
   ) {
     return true
   }

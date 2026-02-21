@@ -663,14 +663,21 @@ function HomePage() {
         streamingTextRef.current.textContent += message.data.text
       }
     } else if (message.type === 'text_stream_stop') {
-      const { message_id, text } = message.data
+      const { message_id, text, interrupted } = message.data
       streamingMessageIdRef.current = null
-      if (!text.trim()) {
+      if (!text.trim() && !interrupted) {
         setMessages((prev) => prev.filter((m) => m.id !== message_id))
       } else {
         setMessages((prev) =>
           prev.map((m) =>
-            m.id === message_id ? { ...m, content: text, isStreaming: false } : m
+            m.id === message_id
+              ? {
+                  ...m,
+                  content: text,
+                  isStreaming: false,
+                  interrupted: Boolean(interrupted),
+                }
+              : m
           )
         )
       }
@@ -682,11 +689,13 @@ function HomePage() {
       return
     } else if (message.type === 'stt_final') {
       finalizeLiveSttMessage(message.text)
+    } else if (message.type === 'stt_state') {
+      return
+    } else if (message.type === 'tts_interrupted') {
+      audioPlayerRef.current?.interrupt()
     } else if (message.type === 'audio_stream_start') {
-      sttAudioCaptureRef.current?.setPausedForPlayback(true)
       audioPlayerRef.current?.handleStreamStart(message.data)
     } else if (message.type === 'audio_stream_stop') {
-      sttAudioCaptureRef.current?.setPausedForPlayback(false)
       audioPlayerRef.current?.handleStreamStop(message.data)
     }
   }, [finalizeLiveSttMessage, upsertLiveSttMessage])
@@ -711,7 +720,7 @@ function HomePage() {
 
       // Finalize any in-flight streaming message on disconnect
       if (status === 'disconnected' || status === 'reconnecting') {
-        sttAudioCaptureRef.current?.setPausedForPlayback(false)
+        audioPlayerRef.current?.stopAll()
 
         const activeId = streamingMessageIdRef.current
         if (activeId) {
@@ -805,7 +814,6 @@ function HomePage() {
       return
     }
 
-    sttAudioCapture.setPausedForPlayback(false)
     setMicrophoneState('on')
   }, [sealLiveSttMessage])
 

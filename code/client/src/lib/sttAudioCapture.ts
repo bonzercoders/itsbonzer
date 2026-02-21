@@ -4,22 +4,30 @@ type STTAudioCaptureOptions = {
   sendBinary: (data: ArrayBuffer) => boolean
   workletModulePath?: string
   targetSampleRate?: number
+  frameDurationMs?: number
+  energyThreshold?: number
+  hangoverFrames?: number
 }
 
 type STTAudioCaptureState = {
   status: STTAudioCaptureStatus
-  pausedForPlayback: boolean
   audioContextState: AudioContextState | null
   error: string | null
 }
 
-const DEFAULT_WORKLET_MODULE = '/worklets/stt-processor.js'
+const DEFAULT_WORKLET_MODULE = '/worklets/stt-capture-processor.js'
 const DEFAULT_TARGET_SAMPLE_RATE = 16000
+const DEFAULT_FRAME_DURATION_MS = 20
+const DEFAULT_ENERGY_THRESHOLD = 0.002
+const DEFAULT_HANGOVER_FRAMES = 6
 
 export class STTAudioCapture {
   private readonly sendBinary: (data: ArrayBuffer) => boolean
   private readonly workletModulePath: string
   private readonly targetSampleRate: number
+  private readonly frameDurationMs: number
+  private readonly energyThreshold: number
+  private readonly hangoverFrames: number
 
   private context: AudioContext | null = null
   private mediaStream: MediaStream | null = null
@@ -28,7 +36,6 @@ export class STTAudioCapture {
   private silentGainNode: GainNode | null = null
   private workletLoaded = false
 
-  private pausedForPlayback = false
   private status: STTAudioCaptureStatus = 'idle'
   private errorMessage: string | null = null
 
@@ -36,6 +43,9 @@ export class STTAudioCapture {
     this.sendBinary = options.sendBinary
     this.workletModulePath = options.workletModulePath ?? DEFAULT_WORKLET_MODULE
     this.targetSampleRate = options.targetSampleRate ?? DEFAULT_TARGET_SAMPLE_RATE
+    this.frameDurationMs = options.frameDurationMs ?? DEFAULT_FRAME_DURATION_MS
+    this.energyThreshold = options.energyThreshold ?? DEFAULT_ENERGY_THRESHOLD
+    this.hangoverFrames = options.hangoverFrames ?? DEFAULT_HANGOVER_FRAMES
   }
 
   async enable(): Promise<boolean> {
@@ -65,6 +75,10 @@ export class STTAudioCapture {
         this.workletLoaded = true
       }
 
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error('getUserMedia is not available in this browser.')
+      }
+
       this.mediaStream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
@@ -75,14 +89,19 @@ export class STTAudioCapture {
       })
 
       this.sourceNode = context.createMediaStreamSource(this.mediaStream)
-      this.workletNode = new AudioWorkletNode(context, 'stt-processor', {
-        processorOptions: { targetSampleRate: this.targetSampleRate },
+      this.workletNode = new AudioWorkletNode(context, 'stt-capture-processor', {
+        processorOptions: {
+          targetSampleRate: this.targetSampleRate,
+          frameDurationMs: this.frameDurationMs,
+          energyThreshold: this.energyThreshold,
+          hangoverFrames: this.hangoverFrames,
+        },
       })
       this.silentGainNode = context.createGain()
       this.silentGainNode.gain.value = 0
 
       this.workletNode.port.onmessage = (event) => {
-        if (this.status !== 'enabled' || this.pausedForPlayback) {
+        if (this.status !== 'enabled') {
           return
         }
 
@@ -108,7 +127,6 @@ export class STTAudioCapture {
 
   disable(): void {
     this.teardownGraph()
-    this.pausedForPlayback = false
     if (this.status !== 'error') {
       this.errorMessage = null
     }
@@ -126,14 +144,9 @@ export class STTAudioCapture {
     this.workletLoaded = false
   }
 
-  setPausedForPlayback(paused: boolean): void {
-    this.pausedForPlayback = paused
-  }
-
   getState(): STTAudioCaptureState {
     return {
       status: this.status,
-      pausedForPlayback: this.pausedForPlayback,
       audioContextState: this.context?.state ?? null,
       error: this.errorMessage,
     }
@@ -142,6 +155,10 @@ export class STTAudioCapture {
   private async ensureAudioContext(): Promise<void> {
     if (this.context && this.context.state !== 'closed') {
       return
+    }
+
+    if (typeof AudioContext === 'undefined') {
+      throw new Error('AudioContext is not supported in this browser.')
     }
 
     this.context = new AudioContext({ sampleRate: 48000 })

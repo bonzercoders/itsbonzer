@@ -48,6 +48,7 @@ export function ChatBubble({ message, character, streamingRef }: ChatBubbleProps
 
   const name = message.name ?? character?.name ?? 'Assistant'
   const initials = getInitials(name)
+  const isInterrupted = Boolean(message.interrupted && !message.isStreaming)
 
   return (
     <div className="flex items-start gap-3 px-4 py-1">
@@ -61,7 +62,14 @@ export function ChatBubble({ message, character, streamingRef }: ChatBubbleProps
       </Avatar>
 
       <div className="flex min-w-0 flex-col gap-1">
-        <span className="text-xs font-medium text-[#8b93a0]">{name}</span>
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-medium text-[#8b93a0]">{name}</span>
+          {isInterrupted ? (
+            <span className="rounded border border-[#7a3b3b] bg-[#3a2020] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.06em] text-[#f2aaaa]">
+              interrupted
+            </span>
+          ) : null}
+        </div>
         <div
           className={cn(
             'max-w-full rounded-2xl rounded-tl-sm px-4 py-2.5',

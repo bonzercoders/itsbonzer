@@ -5,6 +5,7 @@ import sys
 import json
 import time
 import uuid
+import inspect
 import queue
 import nltk
 import torch
@@ -58,6 +59,7 @@ class CharacterResponse:
 class TTSSentence:
     text: str
     index: int
+    turn_id: str
     message_id: str
     character_id: str
     character_name: str
@@ -65,7 +67,8 @@ class TTSSentence:
 
 @dataclass
 class AudioResponseDone:
-    """Typed sentinel — marks end of one character's TTS sentences."""
+    """Typed sentinel marking completion of one character response."""
+    turn_id: str
     message_id: str
     character_id: str
     character_name: str
@@ -75,9 +78,18 @@ class AudioChunk:
     audio_bytes: bytes
     sentence_index: int
     chunk_index: int
+    turn_id: str
     message_id: str
     character_id: str
     character_name: str
+
+@dataclass
+class ActiveTextStream:
+    turn_id: str
+    message_id: str
+    character_id: str
+    character_name: str
+    text: str = ""
 
 @dataclass
 class ModelSettings:
@@ -97,12 +109,12 @@ class Generation:
     last_responder_id: Optional[str]  # character.id or None for user
     is_user_turn: bool
     responded_pairs: Set[Tuple[str, str]] = field(default_factory=set)
-    # (responder_id, triggerer_id) — who has already responded to whom
+    # (responder_id, triggerer_id) â€” who has already responded to whom
 
     @staticmethod
-    def from_user(message: str) -> Generation:
+    def from_user(message: str, turn_id: Optional[str] = None) -> Generation:
         return Generation(
-            turn_id=str(uuid.uuid4()),
+            turn_id=turn_id or str(uuid.uuid4()),
             last_message=message,
             last_responder_id=None,
             is_user_turn=True,
@@ -154,13 +166,24 @@ class STT:
                  on_transcription_update: Optional[Callback] = None,
                  on_transcription_stabilized: Optional[Callback] = None,
                  on_transcription_final: Optional[Callback] = None,
+                 on_recording_start: Optional[Callback] = None,
+                 on_recording_stop: Optional[Callback] = None,
+                 on_transcription_start: Optional[Callback] = None,
+                 on_vad_detect_start: Optional[Callback] = None,
+                 on_vad_detect_stop: Optional[Callback] = None,
                  ):
 
         # Store callbacks with consistent key names
-        self.callbacks: Dict[str, Optional[Callback]] = {'on_transcription_update': on_transcription_update,
-                                                         'on_transcription_stabilized': on_transcription_stabilized,
-                                                         'on_transcription_final': on_transcription_final,
-                                                         }
+        self.callbacks: Dict[str, Optional[Callback]] = {
+            'on_transcription_update': on_transcription_update,
+            'on_transcription_stabilized': on_transcription_stabilized,
+            'on_transcription_final': on_transcription_final,
+            'on_recording_start': on_recording_start,
+            'on_recording_stop': on_recording_stop,
+            'on_transcription_start': on_transcription_start,
+            'on_vad_detect_start': on_vad_detect_start,
+            'on_vad_detect_stop': on_vad_detect_stop,
+        }
 
         self.is_listening = False
         self.loop: Optional[asyncio.AbstractEventLoop] = None
@@ -174,6 +197,11 @@ class STT:
             realtime_model_type="small.en",
             on_realtime_transcription_update=self._on_transcription_update,
             on_realtime_transcription_stabilized=self._on_transcription_stabilized,
+            on_recording_start=self._on_recording_start,
+            on_recording_stop=self._on_recording_stop,
+            on_transcription_start=self._on_transcription_start,
+            on_vad_detect_start=self._on_vad_detect_start,
+            on_vad_detect_stop=self._on_vad_detect_stop,
             silero_sensitivity=0.4,
             webrtc_sensitivity=3,
             post_speech_silence_duration=0.7,
@@ -208,7 +236,7 @@ class STT:
         if callback is None or self.loop is None:
             return
 
-        if asyncio.inspect.iscoroutinefunction(callback):
+        if inspect.iscoroutinefunction(callback):
             asyncio.run_coroutine_threadsafe(callback(*args), self.loop)
         else:
             self.loop.call_soon_threadsafe(callback, *args)
@@ -259,15 +287,32 @@ class STT:
     def _on_transcription_final(self, user_message: str) -> None:
         self.run_callback(self.callbacks.get('on_transcription_final'), user_message)
 
+    def _on_recording_start(self) -> None:
+        self.run_callback(self.callbacks.get('on_recording_start'))
+
+    def _on_recording_stop(self) -> None:
+        self.run_callback(self.callbacks.get('on_recording_stop'))
+
+    def _on_transcription_start(self, *_args) -> None:
+        self.run_callback(self.callbacks.get('on_transcription_start'))
+
+    def _on_vad_detect_start(self) -> None:
+        self.run_callback(self.callbacks.get('on_vad_detect_start'))
+
+    def _on_vad_detect_stop(self) -> None:
+        self.run_callback(self.callbacks.get('on_vad_detect_stop'))
+
 ########################################
 ##--              LLM               --##
 ########################################
 
 class ChatLLM:
 
-    def __init__(self, queues: PipeQueues, api_key: str,on_text_stream_start: Optional[Callable[["Character", str], Awaitable[None]]] = None,
-                 on_text_stream_stop: Optional[Callable[["Character", str, str], Awaitable[None]]] = None,
-                 on_text_chunk: Optional[Callable[[str, "Character", str], Awaitable[None]]] = None):
+    def __init__(self, queues: PipeQueues, api_key: str,
+                 on_text_stream_start: Optional[Callable[["Character", str, str], Awaitable[None]]] = None,
+                 on_text_stream_stop: Optional[Callable[["Character", str, str, str, bool], Awaitable[None]]] = None,
+                 on_text_chunk: Optional[Callable[[str, "Character", str, str], Awaitable[None]]] = None,
+                 is_turn_cancelled: Optional[Callable[[str], bool]] = None):
 
         self.conversation_history: List[Dict] = []
         self.conversation_id: Optional[str] = None
@@ -280,6 +325,7 @@ class ChatLLM:
         self.on_text_stream_start = on_text_stream_start
         self.on_text_stream_stop = on_text_stream_stop
         self.on_text_chunk = on_text_chunk
+        self.is_turn_cancelled = is_turn_cancelled
 
     async def initialize(self):
         """Load active characters from database on startup."""
@@ -320,7 +366,7 @@ class ChatLLM:
         return self.active_characters
 
     def character_instruction_message(self, character: Character) -> Dict[str, str]:
-        """Explicit Character Instructions — pure computation, no I/O."""
+        """Explicit Character Instructions â€” pure computation, no I/O."""
         return {
             'role': 'system',
             'content': f'Based on the conversation history above provide the next reply as {character.name}. Your response should include only {character.name}\'s reply. Do not respond for/as anyone else.'
@@ -374,19 +420,25 @@ class ChatLLM:
         """Background task: pull user messages from stt_queue and process."""
         while True:
             try:
-                user_message: str = await self.queues.stt_queue.get()
+                payload = await self.queues.stt_queue.get()
+                turn_id: Optional[str] = None
+                user_message: str = ""
+                if isinstance(payload, tuple) and len(payload) == 2:
+                    turn_id, user_message = payload
+                elif isinstance(payload, str):
+                    user_message = payload
                 if user_message and user_message.strip():
-                    await self.user_turn(user_message)
+                    await self.user_turn(user_message, turn_id=turn_id)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error processing user message: {e}")
 
-    async def user_turn(self, user_message: str) -> None:
+    async def user_turn(self, user_message: str, turn_id: Optional[str] = None) -> None:
         """Entry point for a new user message. Runs the generation loop
         until no next character is resolved."""
 
-        generation = Generation.from_user(user_message)
+        generation = Generation.from_user(user_message, turn_id=turn_id)
 
         # append user message exactly once
         self.conversation_history.append({
@@ -402,6 +454,7 @@ class ChatLLM:
 
             response = await self.initiate_character_response(
                 character=character,
+                turn_id=generation.turn_id,
                 on_text_stream_start=self.on_text_stream_start,
                 on_text_stream_stop=self.on_text_stream_stop,
             )
@@ -444,9 +497,9 @@ class ChatLLM:
         """Decide who speaks next.
 
         1. Parse last message for a character mention.
-        2. Check loop deterrent — has this pair already fired this turn?
-        3. User turn with no mention → default to first character.
-        4. Character turn with no mention → cycle ends.
+        2. Check loop deterrent â€” has this pair already fired this turn?
+        3. User turn with no mention â†’ default to first character.
+        4. Character turn with no mention â†’ cycle ends.
         """
         mentioned = self.parse_last_message(
             text=generation.last_message,
@@ -459,7 +512,7 @@ class ChatLLM:
                 return mentioned
             return None  # blocked by loop deterrent
 
-        # user spoke but didn't mention anyone — default character
+        # user spoke but didn't mention anyone â€” default character
         if generation.is_user_turn and self.active_characters:
             return self.active_characters[0]
 
@@ -484,26 +537,32 @@ class ChatLLM:
 
     async def initiate_character_response(self,
                                           character: Character,
-                                          on_text_stream_start: Optional[Callable[[Character, str], Awaitable[None]]] = None,
-                                          on_text_stream_stop: Optional[Callable[[Character, str, str], Awaitable[None]]] = None) -> Optional[str]:
+                                          turn_id: str,
+                                          on_text_stream_start: Optional[Callable[[Character, str, str], Awaitable[None]]] = None,
+                                          on_text_stream_stop: Optional[Callable[[Character, str, str, str, bool], Awaitable[None]]] = None) -> Optional[str]:
+
+        if self.is_turn_cancelled and self.is_turn_cancelled(turn_id):
+            return None
 
         model_settings = await self.get_model_settings()
         message_id = str(uuid.uuid4())
         messages = self.build_character_messages(character)
 
         if self.on_text_stream_start:
-            await self.on_text_stream_start(character, message_id)
+            await self.on_text_stream_start(character, message_id, turn_id)
 
         response = await self.stream_character_response(messages=messages,
                                                         character=character,
                                                         message_id=message_id,
+                                                        turn_id=turn_id,
                                                         model_settings=model_settings,
                                                         on_text_chunk=self.on_text_chunk)
 
+        interrupted = bool(self.is_turn_cancelled and self.is_turn_cancelled(turn_id))
         if self.on_text_stream_stop:
-            await self.on_text_stream_stop(character, message_id, response)
+            await self.on_text_stream_stop(character, message_id, response, turn_id, interrupted)
 
-        if response:
+        if response and not interrupted:
             self.conversation_history.append({"role": "assistant","name": character.name,"content": response})
             return response
 
@@ -513,12 +572,16 @@ class ChatLLM:
                                         messages: List[Dict[str, str]],
                                         character: Character,
                                         message_id: str,
+                                        turn_id: str,
                                         model_settings: ModelSettings,
-                                        on_text_chunk: Optional[Callable[[str, Character, str], Awaitable[None]]] = None) -> str:
+                                        on_text_chunk: Optional[Callable[[str, Character, str, str], Awaitable[None]]] = None) -> str:
         """Stream LLM tokens, split into sentences, push TTSSentence items to sentence_queue."""
 
         sentence_index = 0
         response = ""
+
+        if self.is_turn_cancelled and self.is_turn_cancelled(turn_id):
+            return response
 
         self.save_conversation_context(messages, character, model_settings)
 
@@ -541,12 +604,14 @@ class ChatLLM:
             async def chunk_generator() -> AsyncGenerator[str, None]:
                 nonlocal response
                 async for chunk in stream:
+                    if self.is_turn_cancelled and self.is_turn_cancelled(turn_id):
+                        break
                     if chunk.choices and chunk.choices[0].delta:
                         content = chunk.choices[0].delta.content
                         if content:
                             response += content
                             if on_text_chunk:
-                                await on_text_chunk(content, character, message_id)
+                                await on_text_chunk(content, character, message_id, turn_id)
                             yield content
 
             async for sentence in generate_sentences_async(
@@ -555,14 +620,17 @@ class ChatLLM:
                 minimum_sentence_length=25,
                 tokenizer="nltk",
                 quick_yield_single_sentence_fragment=True,
-                sentence_fragment_delimiters=".?!;:,\n…)]}。-",
-                full_sentence_delimiters=".?!\n…。",
+                sentence_fragment_delimiters=".?!;:,\nâ€¦)]}ã€‚-",
+                full_sentence_delimiters=".?!\nâ€¦ã€‚",
             ):
                 sentence_text = sentence.strip()
                 if sentence_text:
+                    if self.is_turn_cancelled and self.is_turn_cancelled(turn_id):
+                        break
                     await self.queues.sentence_queue.put(TTSSentence(
                         text=sentence_text,
                         index=sentence_index,
+                        turn_id=turn_id,
                         message_id=message_id,
                         character_id=character.id,
                         character_name=character.name,
@@ -576,6 +644,7 @@ class ChatLLM:
 
         finally:
             await self.queues.sentence_queue.put(AudioResponseDone(
+                turn_id=turn_id,
                 message_id=message_id,
                 character_id=character.id,
                 character_name=character.name,
@@ -603,9 +672,10 @@ def revert_delay_pattern(data: torch.Tensor, start_idx: int = 0) -> torch.Tensor
 
 class TTS:
 
-    def __init__(self, queues: PipeQueues):
+    def __init__(self, queues: PipeQueues, is_turn_cancelled: Optional[Callable[[str], bool]] = None):
         self.queues = queues
         self._task_tts_worker: Optional[asyncio.Task] = None
+        self.is_turn_cancelled = is_turn_cancelled
 
         # Set during initialize()
         self.engine: Optional[HiggsAudioServeEngine] = None
@@ -642,20 +712,30 @@ class TTS:
 
             try:
                 if isinstance(item, AudioResponseDone):
+                    if self.is_turn_cancelled and self.is_turn_cancelled(item.turn_id):
+                        logger.info(f"[TTS] Dropping completion sentinel for cancelled turn {item.turn_id}")
+                        continue
                     await self.queues.tts_queue.put(item)
                     logger.info(f"[TTS] End of response for {item.character_name}")
                     continue
 
                 sentence: TTSSentence = item
+                if self.is_turn_cancelled and self.is_turn_cancelled(sentence.turn_id):
+                    logger.info(f"[TTS] Dropping sentence {sentence.index} for cancelled turn {sentence.turn_id}")
+                    continue
 
                 logger.info(f"[TTS] Generating audio for sentence {sentence.index}")
                 chunk_index = 0
 
                 try:
-                    async for pcm_bytes in self.synthesize_speech(sentence.text, sentence.voice_id):
+                    async for pcm_bytes in self.synthesize_speech(sentence.text, sentence.voice_id, sentence.turn_id):
+                        if self.is_turn_cancelled and self.is_turn_cancelled(sentence.turn_id):
+                            logger.info(f"[TTS] Stopping synthesis for cancelled turn {sentence.turn_id}")
+                            break
                         await self.queues.tts_queue.put(AudioChunk(audio_bytes=pcm_bytes,
                                                                    sentence_index=sentence.index,
                                                                    chunk_index=chunk_index,
+                                                                   turn_id=sentence.turn_id,
                                                                    message_id=sentence.message_id,
                                                                    character_id=sentence.character_id,
                                                                    character_name=sentence.character_name)
@@ -711,11 +791,13 @@ class TTS:
 
         return messages
     
-    async def synthesize_speech(self, text: str, voice_id: str) -> AsyncGenerator[bytes, None]:
+    async def synthesize_speech(self, text: str, voice_id: str, turn_id: str) -> AsyncGenerator[bytes, None]:
         """Stream PCM16 audio chunks from Higgs Audio engine."""
 
         if not voice_id:
             raise ValueError("Cannot synthesize speech without voice_id")
+        if self.is_turn_cancelled and self.is_turn_cancelled(turn_id):
+            return
 
         selected_voice = await db.get_voice(voice_id)
         messages = await self.load_voice_reference(selected_voice)
@@ -739,6 +821,8 @@ class TTS:
                 ras_win_max_num_repeat=2,
                 force_audio_gen=True,
             ):
+                if self.is_turn_cancelled and self.is_turn_cancelled(turn_id):
+                    break
 
                 if delta.audio_tokens is None:
                     continue
@@ -780,6 +864,8 @@ class TTS:
 
         # Flush remaining tokens
         if seq_len > 0 and seq_len % self.chunk_size != 0 and audio_tokens:
+            if self.is_turn_cancelled and self.is_turn_cancelled(turn_id):
+                return
             audio_tensor = torch.cat(audio_tokens, dim=-1)
             remaining = seq_len % self.chunk_size
 
@@ -839,14 +925,27 @@ class WebSocketManager:
 
         self.user_name = "Jay"
         self.stream_start_time: Optional[float] = None
+        self.active_turn_id: Optional[str] = None
+        self.cancelled_turn_ids: Set[str] = set()
+        self.tts_is_playing = False
+        self.active_audio_stream: Optional[AudioChunk] = None
+        self.active_text_stream: Optional[ActiveTextStream] = None
+        self.stt_state: str = "inactive"
 
     async def initialize(self):
         """Initialize all pipeline components at startup."""
         api_key = os.getenv("OPENROUTER_API_KEY", "")
 
-        self.stt = STT(on_transcription_update=self.on_transcription_update,
-                       on_transcription_stabilized=self.on_transcription_stabilized,
-                       on_transcription_final=self.on_transcription_final)
+        self.stt = STT(
+            on_transcription_update=self.on_transcription_update,
+            on_transcription_stabilized=self.on_transcription_stabilized,
+            on_transcription_final=self.on_transcription_final,
+            on_recording_start=self.on_recording_start,
+            on_recording_stop=self.on_recording_stop,
+            on_transcription_start=self.on_transcription_start,
+            on_vad_detect_start=self.on_vad_detect_start,
+            on_vad_detect_stop=self.on_vad_detect_stop,
+        )
 
         self.stt.set_event_loop(asyncio.get_event_loop())
 
@@ -856,21 +955,22 @@ class WebSocketManager:
             on_text_stream_start=self.on_text_stream_start,
             on_text_stream_stop=self.on_text_stream_stop,
             on_text_chunk=self.on_text_chunk,
+            is_turn_cancelled=self.is_turn_cancelled,
         )
         await self.chat.initialize()
 
-        self.tts = TTS(queues=self.queues)
+        self.tts = TTS(queues=self.queues, is_turn_cancelled=self.is_turn_cancelled)
         await self.tts.initialize()
 
         logger.info(f"Initialized with {len(self.chat.active_characters)} active characters")
 
     async def connect(self, websocket: WebSocket):
-        """Accept WebSocket connection, start pipeline + audio streamer."""
-
+        """Accept WebSocket connection, start pipeline and audio streamer."""
         await websocket.accept()
         self.websocket = websocket
 
         await self._conversation_tasks()
+        await self.emit_stt_state()
 
         logger.info("WebSocket connected")
 
@@ -880,43 +980,154 @@ class WebSocketManager:
             self.stt.stop_listening()
 
         self.websocket = None
+        self.stt_state = "inactive"
+        self.tts_is_playing = False
+        self.active_audio_stream = None
+        self.active_text_stream = None
 
     async def shutdown(self):
         await self.disconnect()
 
     async def _conversation_tasks(self) -> None:
-
-        if self._task_user_message is None or self._task_user_message.done():
+        if self.chat and (self._task_user_message is None or self._task_user_message.done()):
             self._task_user_message = asyncio.create_task(self.chat.get_user_message())
 
-        if self._task_tts_worker is None or self._task_tts_worker.done():
+        if self.tts and (self._task_tts_worker is None or self._task_tts_worker.done()):
             self._task_tts_worker = asyncio.create_task(self.tts.tts_worker())
 
         if self._task_stream_audio is None or self._task_stream_audio.done():
             self._task_stream_audio = asyncio.create_task(self.stream_audio())
 
+    def is_turn_cancelled(self, turn_id: str) -> bool:
+        return turn_id in self.cancelled_turn_ids
+
+    async def emit_stt_state(self) -> None:
+        await self.send_text_to_client({"type": "stt_state", "data": {"state": self.stt_state}})
+
+    async def set_stt_state(self, next_state: str) -> None:
+        if self.stt_state == next_state:
+            return
+        self.stt_state = next_state
+        await self.emit_stt_state()
+
+    async def start_new_turn(self, turn_id: str) -> None:
+        if self.active_turn_id and self.active_turn_id != turn_id:
+            await self.cancel_active_turn(reason="new_turn", emit_client_event=False)
+        self.active_turn_id = turn_id
+        self.cancelled_turn_ids.discard(turn_id)
+
+    def _drain_queue_for_cancelled_turns(self, target_queue: asyncio.Queue) -> int:
+        retained: List[Any] = []
+        removed = 0
+
+        while True:
+            try:
+                item = target_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+            target_queue.task_done()
+            item_turn_id = getattr(item, "turn_id", None)
+            if item_turn_id in self.cancelled_turn_ids:
+                removed += 1
+                continue
+            retained.append(item)
+
+        for item in retained:
+            target_queue.put_nowait(item)
+
+        return removed
+
+    async def cancel_active_turn(self, reason: str, emit_client_event: bool = True) -> Optional[str]:
+        turn_id = self.active_turn_id
+        if not turn_id:
+            return None
+        if turn_id in self.cancelled_turn_ids:
+            return turn_id
+
+        self.cancelled_turn_ids.add(turn_id)
+
+        interrupted_message_id: Optional[str] = None
+        if self.active_text_stream and self.active_text_stream.turn_id == turn_id:
+            interrupted_message_id = self.active_text_stream.message_id
+
+        if emit_client_event and reason == "barge_in":
+            interruption_data: Dict[str, str] = {"reason": "barge_in"}
+            if interrupted_message_id:
+                interruption_data["message_id"] = interrupted_message_id
+            await self.send_text_to_client({
+                "type": "tts_interrupted",
+                "data": interruption_data,
+            })
+
+        if self.active_audio_stream and self.active_audio_stream.turn_id == turn_id:
+            await self.on_audio_stream_stop(self.active_audio_stream)
+            self.active_audio_stream = None
+
+        if self.active_text_stream and self.active_text_stream.turn_id == turn_id:
+            interrupted_stream = self.active_text_stream
+            self.active_text_stream = None
+            await self.send_text_to_client({
+                "type": "text_stream_stop",
+                "data": {
+                    "character_id": interrupted_stream.character_id,
+                    "character_name": interrupted_stream.character_name,
+                    "message_id": interrupted_stream.message_id,
+                    "text": interrupted_stream.text,
+                    "interrupted": True,
+                },
+            })
+
+        removed_sentences = self._drain_queue_for_cancelled_turns(self.queues.sentence_queue)
+        removed_audio = self._drain_queue_for_cancelled_turns(self.queues.tts_queue)
+
+        logger.info(
+            f"[TURN] Cancelled {turn_id} ({reason}); drained {removed_sentences} sentence items and {removed_audio} audio items"
+        )
+
+        self.tts_is_playing = False
+        if self.active_turn_id == turn_id:
+            self.active_turn_id = None
+
+        if len(self.cancelled_turn_ids) > 1024:
+            self.cancelled_turn_ids.clear()
+
+        return turn_id
+
     async def stream_audio(self) -> None:
         """Long-running consumer: pull audio chunks from tts_queue and stream to client."""
-
-        active_stream_chunk: Optional[AudioChunk] = None
-
         try:
             while True:
                 item = await self.queues.tts_queue.get()
                 try:
-                    # Typed sentinel — this character's audio is done
                     if isinstance(item, AudioResponseDone):
-                        if active_stream_chunk:
-                            await self.on_audio_stream_stop(active_stream_chunk)
-                        active_stream_chunk = None
+                        if self.is_turn_cancelled(item.turn_id):
+                            continue
+
+                        if (
+                            self.active_audio_stream
+                            and self.active_audio_stream.turn_id == item.turn_id
+                            and self.active_audio_stream.message_id == item.message_id
+                        ):
+                            await self.on_audio_stream_stop(self.active_audio_stream)
+                            self.active_audio_stream = None
                         continue
 
                     chunk: AudioChunk = item
 
-                    if active_stream_chunk is None:
+                    if self.is_turn_cancelled(chunk.turn_id):
+                        continue
+                    if self.active_turn_id and chunk.turn_id != self.active_turn_id:
+                        continue
+
+                    if (
+                        self.active_audio_stream is None
+                        or self.active_audio_stream.turn_id != chunk.turn_id
+                        or self.active_audio_stream.message_id != chunk.message_id
+                    ):
                         await self.on_audio_stream_start(chunk)
 
-                    active_stream_chunk = chunk
+                    self.active_audio_stream = chunk
 
                     if self.websocket:
                         await self.websocket.send_bytes(chunk.audio_bytes)
@@ -927,7 +1138,7 @@ class WebSocketManager:
             logger.debug("[Transport] Audio streamer cancelled")
 
     async def refresh_active_characters(self):
-        """Refresh active characters from database (call when characters change)"""
+        """Refresh active characters from database (call when characters change)."""
         if self.chat:
             self.chat.active_characters = await self.chat.get_active_characters()
             logger.info(f"Refreshed to {len(self.chat.active_characters)} active characters")
@@ -940,36 +1151,130 @@ class WebSocketManager:
     async def on_transcription_stabilized(self, text: str):
         await self.send_text_to_client({"type": "stt_stabilized", "text": text})
 
+    async def on_recording_start(self):
+        await self.set_stt_state("recording")
+        if self.tts_is_playing:
+            await self.cancel_active_turn(reason="barge_in", emit_client_event=True)
+
+    async def on_recording_stop(self):
+        if self.stt and self.stt.is_listening:
+            await self.set_stt_state("listening")
+
+    async def on_transcription_start(self):
+        await self.set_stt_state("transcribing")
+
+    async def on_vad_detect_start(self):
+        if self.stt and self.stt.is_listening and self.stt_state == "inactive":
+            await self.set_stt_state("listening")
+
+    async def on_vad_detect_stop(self):
+        if self.stt and self.stt.is_listening and self.stt_state != "inactive":
+            await self.set_stt_state("listening")
+
     async def on_transcription_final(self, user_message: str):
+        turn_id = str(uuid.uuid4())
+        await self.start_new_turn(turn_id)
         self.stream_start_time = time.time()
-        await self.queues.stt_queue.put(user_message)
+        await self.queues.stt_queue.put((turn_id, user_message))
         await self.send_text_to_client({"type": "stt_final", "text": user_message})
+        await self.set_stt_state("listening")
 
-    async def on_text_stream_start(self, character: Character, message_id: str):
-        await self.send_text_to_client({"type": "text_stream_start",
-                                        "data": {"character_id": character.id, "character_name": character.name, "message_id": message_id}})
+    async def on_text_stream_start(self, character: Character, message_id: str, turn_id: str):
+        if self.is_turn_cancelled(turn_id):
+            return
 
-    async def on_text_chunk(self, text: str, character: Character, message_id: str):
+        self.active_text_stream = ActiveTextStream(
+            turn_id=turn_id,
+            message_id=message_id,
+            character_id=character.id,
+            character_name=character.name,
+            text="",
+        )
+
+        await self.send_text_to_client({
+            "type": "text_stream_start",
+            "data": {
+                "character_id": character.id,
+                "character_name": character.name,
+                "message_id": message_id,
+            },
+        })
+
+    async def on_text_chunk(self, text: str, character: Character, message_id: str, turn_id: str):
         """Forward a single LLM text chunk to the client."""
-        await self.send_text_to_client({"type": "text_chunk",
-                                        "data": {"text": text, "character_id": character.id, "character_name": character.name, "message_id": message_id}})
+        if self.is_turn_cancelled(turn_id):
+            return
 
-    async def on_text_stream_stop(self, character: Character, message_id: str, text: str):
-        await self.send_text_to_client({"type": "text_stream_stop",
-                                        "data": {"character_id": character.id, "character_name": character.name, "message_id": message_id, "text": text}})
+        if (
+            self.active_text_stream
+            and self.active_text_stream.turn_id == turn_id
+            and self.active_text_stream.message_id == message_id
+        ):
+            self.active_text_stream.text += text
+
+        await self.send_text_to_client({
+            "type": "text_chunk",
+            "data": {
+                "text": text,
+                "character_id": character.id,
+                "character_name": character.name,
+                "message_id": message_id,
+            },
+        })
+
+    async def on_text_stream_stop(self, character: Character, message_id: str, text: str, turn_id: str, interrupted: bool):
+        if self.is_turn_cancelled(turn_id) and not interrupted:
+            interrupted = True
+
+        if (
+            self.active_text_stream
+            and self.active_text_stream.turn_id == turn_id
+            and self.active_text_stream.message_id == message_id
+        ):
+            if not text and self.active_text_stream.text:
+                text = self.active_text_stream.text
+            self.active_text_stream = None
+        elif self.is_turn_cancelled(turn_id):
+            return
+
+        await self.send_text_to_client({
+            "type": "text_stream_stop",
+            "data": {
+                "character_id": character.id,
+                "character_name": character.name,
+                "message_id": message_id,
+                "text": text,
+                "interrupted": interrupted,
+            },
+        })
 
     async def on_audio_stream_start(self, chunk: AudioChunk):
+        self.tts_is_playing = True
         sample_rate = self.tts.sample_rate if self.tts else 24000
-        await self.send_text_to_client({"type": "audio_stream_start",
-                                        "data": {"character_id": chunk.character_id, "character_name": chunk.character_name, "message_id": chunk.message_id, "sample_rate": sample_rate}})
+        await self.send_text_to_client({
+            "type": "audio_stream_start",
+            "data": {
+                "character_id": chunk.character_id,
+                "character_name": chunk.character_name,
+                "message_id": chunk.message_id,
+                "sample_rate": sample_rate,
+            },
+        })
 
         if self.stream_start_time is not None:
             latency = time.time() - self.stream_start_time
             logger.info(f"Audio stream start, latency to first chunk: {latency:.2f}s")
 
     async def on_audio_stream_stop(self, chunk: AudioChunk):
-        await self.send_text_to_client({"type": "audio_stream_stop",
-                                        "data": {"character_id": chunk.character_id, "character_name": chunk.character_name, "message_id": chunk.message_id}})
+        self.tts_is_playing = False
+        await self.send_text_to_client({
+            "type": "audio_stream_stop",
+            "data": {
+                "character_id": chunk.character_id,
+                "character_name": chunk.character_name,
+                "message_id": chunk.message_id,
+            },
+        })
 
     # ------ WebSocket message handling ------ #
 
@@ -994,10 +1299,12 @@ class WebSocketManager:
         elif message_type == "start_listening":
             if self.stt:
                 self.stt.start_listening()
+                await self.set_stt_state("listening")
 
         elif message_type == "stop_listening":
             if self.stt:
                 self.stt.stop_listening()
+                await self.set_stt_state("inactive")
 
         elif message_type == "model_settings":
             model_settings = ModelSettings(
@@ -1008,7 +1315,7 @@ class WebSocketManager:
                 top_k=int(data.get("top_k", 40)),
                 frequency_penalty=float(data.get("frequency_penalty", 0.0)),
                 presence_penalty=float(data.get("presence_penalty", 0.0)),
-                repetition_penalty=float(data.get("repetition_penalty", 1.0))
+                repetition_penalty=float(data.get("repetition_penalty", 1.0)),
             )
             if self.chat:
                 await self.chat.set_model_settings(model_settings)
@@ -1031,14 +1338,15 @@ class WebSocketManager:
 
     async def handle_user_message(self, user_message: str):
         """Process manually sent user message (typed, not from STT)."""
+        turn_id = str(uuid.uuid4())
+        await self.start_new_turn(turn_id)
         self.stream_start_time = time.time()
-        await self.queues.stt_queue.put(user_message)
+        await self.queues.stt_queue.put((turn_id, user_message))
 
     async def send_text_to_client(self, data: dict):
         """Send JSON message to client."""
         if self.websocket:
             await self.websocket.send_text(json.dumps(data))
-
 ########################################
 ##--           FastAPI App          --##
 ########################################
@@ -1106,3 +1414,5 @@ app.mount("/", StaticFiles(directory="client", html=True), name="client")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
