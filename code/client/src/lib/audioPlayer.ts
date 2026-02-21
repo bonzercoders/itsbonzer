@@ -16,6 +16,7 @@ export class AudioPlayer {
   private transitionSource: AudioBufferSourceNode | null = null
 
   onSpeakerChange?: (characterId: string | null, characterName: string | null) => void
+  onSessionPlaybackComplete?: (characterId: string, messageId: string) => void
 
   handleStreamStart(data: {
     character_id: string
@@ -168,7 +169,10 @@ export class AudioPlayer {
 
   private advanceSession(): void {
     this.transitionSource = null
-    this.sessionQueue.shift()
+    const completed = this.sessionQueue.shift()
+    if (completed && completed.done) {
+      this.onSessionPlaybackComplete?.(completed.characterId, completed.messageId)
+    }
 
     if (this.sessionQueue.length === 0) {
       this.onSpeakerChange?.(null, null)

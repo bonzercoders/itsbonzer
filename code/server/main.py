@@ -42,6 +42,9 @@ logging.basicConfig(filename="filelogger.log", format='%(asctime)s - %(levelname
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+PLAYBACK_COMPLETE_TIMEOUT_SECONDS = 30.0
+PlaybackSessionKey = Tuple[str, str]
+
 ########################################
 ##--          Data Classes          --##
 ########################################
@@ -928,6 +931,8 @@ class WebSocketManager:
         self.active_turn_id: Optional[str] = None
         self.cancelled_turn_ids: Set[str] = set()
         self.tts_is_playing = False
+        self.active_playback_sessions: Set[PlaybackSessionKey] = set()
+        self.playback_stop_timeouts: Dict[PlaybackSessionKey, asyncio.TimerHandle] = {}
         self.active_audio_stream: Optional[AudioChunk] = None
         self.active_text_stream: Optional[ActiveTextStream] = None
         self.stt_state: str = "inactive"
@@ -981,7 +986,7 @@ class WebSocketManager:
 
         self.websocket = None
         self.stt_state = "inactive"
-        self.tts_is_playing = False
+        self._clear_playback_sessions(reason="disconnect")
         self.active_audio_stream = None
         self.active_text_stream = None
 
@@ -1009,6 +1014,82 @@ class WebSocketManager:
             return
         self.stt_state = next_state
         await self.emit_stt_state()
+
+    def _set_tts_playback_state(self, is_playing: bool, reason: str) -> None:
+        if self.tts_is_playing == is_playing:
+            return
+        self.tts_is_playing = is_playing
+        logger.info(f"[TTS] tts_is_playing={is_playing} ({reason})")
+
+    def _playback_session_key(self, character_id: str, message_id: str) -> PlaybackSessionKey:
+        return (character_id, message_id)
+
+    def _cancel_playback_timeout(self, session_key: PlaybackSessionKey) -> None:
+        timeout_handle = self.playback_stop_timeouts.pop(session_key, None)
+        if timeout_handle:
+            timeout_handle.cancel()
+
+    def _refresh_tts_playing_from_sessions(self, reason: str) -> None:
+        self._set_tts_playback_state(len(self.active_playback_sessions) > 0, reason)
+
+    def _mark_playback_started(self, character_id: str, message_id: str) -> None:
+        session_key = self._playback_session_key(character_id, message_id)
+        self._cancel_playback_timeout(session_key)
+        self.active_playback_sessions.add(session_key)
+        logger.info(
+            f"[TTS] Playback started for {character_id}/{message_id}; "
+            f"active_sessions={len(self.active_playback_sessions)}"
+        )
+        self._refresh_tts_playing_from_sessions("audio_stream_start")
+
+    def _schedule_playback_stop_failsafe(self, character_id: str, message_id: str) -> None:
+        session_key = self._playback_session_key(character_id, message_id)
+        if session_key not in self.active_playback_sessions:
+            return
+
+        self._cancel_playback_timeout(session_key)
+
+        def expire() -> None:
+            self.playback_stop_timeouts.pop(session_key, None)
+            if session_key not in self.active_playback_sessions:
+                return
+
+            self.active_playback_sessions.discard(session_key)
+            logger.warning(
+                f"[TTS] Playback completion failsafe expired for "
+                f"{character_id}/{message_id}; active_sessions={len(self.active_playback_sessions)}"
+            )
+            self._refresh_tts_playing_from_sessions("playback_failsafe_expired")
+
+        loop = asyncio.get_running_loop()
+        self.playback_stop_timeouts[session_key] = loop.call_later(
+            PLAYBACK_COMPLETE_TIMEOUT_SECONDS,
+            expire,
+        )
+
+    def _clear_playback_sessions(self, reason: str) -> None:
+        active_session_count = len(self.active_playback_sessions)
+
+        for timeout_handle in self.playback_stop_timeouts.values():
+            timeout_handle.cancel()
+        self.playback_stop_timeouts.clear()
+        self.active_playback_sessions.clear()
+
+        if active_session_count > 0:
+            logger.info(f"[TTS] Cleared {active_session_count} playback session(s) ({reason})")
+        self._set_tts_playback_state(False, reason)
+
+    async def on_audio_playback_complete(self, character_id: str, message_id: str) -> None:
+        session_key = self._playback_session_key(character_id, message_id)
+        self._cancel_playback_timeout(session_key)
+
+        did_remove = session_key in self.active_playback_sessions
+        self.active_playback_sessions.discard(session_key)
+        logger.info(
+            f"[TTS] Client playback complete for {character_id}/{message_id}; "
+            f"known_session={did_remove}; active_sessions={len(self.active_playback_sessions)}"
+        )
+        self._refresh_tts_playing_from_sessions("audio_playback_complete")
 
     async def start_new_turn(self, turn_id: str) -> None:
         if self.active_turn_id and self.active_turn_id != turn_id:
@@ -1085,7 +1166,7 @@ class WebSocketManager:
             f"[TURN] Cancelled {turn_id} ({reason}); drained {removed_sentences} sentence items and {removed_audio} audio items"
         )
 
-        self.tts_is_playing = False
+        self._clear_playback_sessions(reason=f"cancel_active_turn:{reason}")
         if self.active_turn_id == turn_id:
             self.active_turn_id = None
 
@@ -1249,7 +1330,7 @@ class WebSocketManager:
         })
 
     async def on_audio_stream_start(self, chunk: AudioChunk):
-        self.tts_is_playing = True
+        self._mark_playback_started(chunk.character_id, chunk.message_id)
         sample_rate = self.tts.sample_rate if self.tts else 24000
         await self.send_text_to_client({
             "type": "audio_stream_start",
@@ -1266,7 +1347,9 @@ class WebSocketManager:
             logger.info(f"Audio stream start, latency to first chunk: {latency:.2f}s")
 
     async def on_audio_stream_stop(self, chunk: AudioChunk):
-        self.tts_is_playing = False
+        logger.info(
+            f"[TTS] Emitting audio_stream_stop for {chunk.character_id}/{chunk.message_id}"
+        )
         await self.send_text_to_client({
             "type": "audio_stream_stop",
             "data": {
@@ -1275,6 +1358,7 @@ class WebSocketManager:
                 "message_id": chunk.message_id,
             },
         })
+        self._schedule_playback_stop_failsafe(chunk.character_id, chunk.message_id)
 
     # ------ WebSocket message handling ------ #
 
@@ -1305,6 +1389,17 @@ class WebSocketManager:
             if self.stt:
                 self.stt.stop_listening()
                 await self.set_stt_state("inactive")
+
+        elif message_type == "audio_playback_complete":
+            character_id = data.get("character_id")
+            message_id = data.get("message_id")
+            if isinstance(character_id, str) and isinstance(message_id, str):
+                await self.on_audio_playback_complete(character_id, message_id)
+            else:
+                logger.warning(
+                    "[TTS] Received malformed audio_playback_complete payload: "
+                    f"{data}"
+                )
 
         elif message_type == "model_settings":
             model_settings = ModelSettings(

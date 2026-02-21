@@ -448,6 +448,37 @@ function HomePage() {
   }, [microphoneState])
 
   useEffect(() => {
+    const audioPlayer = audioPlayerRef.current
+    if (!audioPlayer) {
+      return
+    }
+
+    audioPlayer.onSessionPlaybackComplete = (characterId, messageId) => {
+      const websocketClient = websocketClientRef.current
+      if (!websocketClient) {
+        return
+      }
+
+      const sent = websocketClient.send({
+        type: 'audio_playback_complete',
+        character_id: characterId,
+        message_id: messageId,
+      })
+      if (!sent) {
+        console.debug(
+          '[TTS] Failed to send audio_playback_complete',
+          characterId,
+          messageId
+        )
+      }
+    }
+
+    return () => {
+      audioPlayer.onSessionPlaybackComplete = undefined
+    }
+  }, [])
+
+  useEffect(() => {
     let cancelled = false
     fetchCharacters()
       .then((chars) => {

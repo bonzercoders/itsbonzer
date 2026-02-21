@@ -6,8 +6,6 @@ class STTCaptureProcessor extends AudioWorkletProcessor {
     this.inputSampleRate = sampleRate;
     this.targetSampleRate = processorOptions.targetSampleRate ?? 16000;
     this.frameDurationMs = processorOptions.frameDurationMs ?? 20;
-    this.energyThreshold = processorOptions.energyThreshold ?? 0;
-    this.hangoverFrames = processorOptions.hangoverFrames ?? 0;
 
     this.frameSamples = Math.max(
       1,
@@ -18,7 +16,6 @@ class STTCaptureProcessor extends AudioWorkletProcessor {
 
     this.inputBuffer = [];
     this.resampledBuffer = [];
-    this.hangoverCounter = 0;
   }
 
   process(inputs) {
@@ -65,27 +62,6 @@ class STTCaptureProcessor extends AudioWorkletProcessor {
     while (this.resampledBuffer.length >= this.frameSamples) {
       const frame = this.resampledBuffer.slice(0, this.frameSamples);
       this.resampledBuffer = this.resampledBuffer.slice(this.frameSamples);
-
-      let energySum = 0;
-      for (let i = 0; i < frame.length; i += 1) {
-        energySum += Math.abs(frame[i]);
-      }
-      const meanEnergy = energySum / frame.length;
-
-      let shouldSend = true;
-      if (this.energyThreshold > 0 && meanEnergy < this.energyThreshold) {
-        if (this.hangoverCounter > 0) {
-          this.hangoverCounter -= 1;
-        } else {
-          shouldSend = false;
-        }
-      } else {
-        this.hangoverCounter = this.hangoverFrames;
-      }
-
-      if (!shouldSend) {
-        continue;
-      }
 
       const pcm16 = new Int16Array(frame.length);
       for (let i = 0; i < frame.length; i += 1) {

@@ -23,6 +23,7 @@ export type OutboundMessage =
   | { type: 'user_message'; text: string }
   | { type: 'start_listening' }
   | { type: 'stop_listening' }
+  | { type: 'audio_playback_complete'; character_id: string; message_id: string }
   | { type: 'clear_history' }
   | { type: 'refresh_characters' }
   | ModelSettingsMessage

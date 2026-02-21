@@ -5,8 +5,6 @@ type STTAudioCaptureOptions = {
   workletModulePath?: string
   targetSampleRate?: number
   frameDurationMs?: number
-  energyThreshold?: number
-  hangoverFrames?: number
 }
 
 type STTAudioCaptureState = {
@@ -18,16 +16,12 @@ type STTAudioCaptureState = {
 const DEFAULT_WORKLET_MODULE = '/worklets/stt-capture-processor.js'
 const DEFAULT_TARGET_SAMPLE_RATE = 16000
 const DEFAULT_FRAME_DURATION_MS = 20
-const DEFAULT_ENERGY_THRESHOLD = 0.002
-const DEFAULT_HANGOVER_FRAMES = 6
 
 export class STTAudioCapture {
   private readonly sendBinary: (data: ArrayBuffer) => boolean
   private readonly workletModulePath: string
   private readonly targetSampleRate: number
   private readonly frameDurationMs: number
-  private readonly energyThreshold: number
-  private readonly hangoverFrames: number
 
   private context: AudioContext | null = null
   private mediaStream: MediaStream | null = null
@@ -44,8 +38,6 @@ export class STTAudioCapture {
     this.workletModulePath = options.workletModulePath ?? DEFAULT_WORKLET_MODULE
     this.targetSampleRate = options.targetSampleRate ?? DEFAULT_TARGET_SAMPLE_RATE
     this.frameDurationMs = options.frameDurationMs ?? DEFAULT_FRAME_DURATION_MS
-    this.energyThreshold = options.energyThreshold ?? DEFAULT_ENERGY_THRESHOLD
-    this.hangoverFrames = options.hangoverFrames ?? DEFAULT_HANGOVER_FRAMES
   }
 
   async enable(): Promise<boolean> {
@@ -93,8 +85,6 @@ export class STTAudioCapture {
         processorOptions: {
           targetSampleRate: this.targetSampleRate,
           frameDurationMs: this.frameDurationMs,
-          energyThreshold: this.energyThreshold,
-          hangoverFrames: this.hangoverFrames,
         },
       })
       this.silentGainNode = context.createGain()
