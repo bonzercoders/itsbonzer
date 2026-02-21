@@ -515,7 +515,7 @@ class ChatLLM:
                 return mentioned
             return None  # blocked by loop deterrent
 
-        # user spoke but didn't mention anyone â€” default character
+        # user spoke but didn't mention anyone  default character
         if generation.is_user_turn and self.active_characters:
             return self.active_characters[0]
 
