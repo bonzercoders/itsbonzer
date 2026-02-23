@@ -645,7 +645,6 @@ class WebSocketManager:
         self._task_stream_audio: Optional[asyncio.Task] = None
 
         self.user_name = "Jay"
-        self.stream_start_time: Optional[float] = None
         self.active_turn_id: Optional[str] = None
         self.cancelled_turn_ids: Set[str] = set()
         self.tts_is_playing = False
@@ -971,7 +970,6 @@ class WebSocketManager:
     async def on_transcription_final(self, user_message: str):
         turn_id = str(uuid.uuid4())
         await self.start_new_turn(turn_id)
-        self.stream_start_time = time.time()
         await self.queues.stt_queue.put((turn_id, user_message))
         await self.send_text_to_client({"type": "stt_final", "text": user_message})
         await self.set_stt_state("listening")
@@ -1057,10 +1055,6 @@ class WebSocketManager:
                 "sample_rate": sample_rate,
             },
         })
-
-        if self.stream_start_time is not None:
-            latency = time.time() - self.stream_start_time
-            logger.info(f"Audio stream start, latency to first chunk: {latency:.2f}s")
 
     async def on_audio_stream_stop(self, chunk: AudioChunk):
         logger.info(
@@ -1151,7 +1145,6 @@ class WebSocketManager:
         """Process manually sent user message (typed, not from STT)."""
         turn_id = str(uuid.uuid4())
         await self.start_new_turn(turn_id)
-        self.stream_start_time = time.time()
         await self.queues.stt_queue.put((turn_id, user_message))
 
     async def send_text_to_client(self, data: dict):
