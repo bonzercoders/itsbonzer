@@ -435,6 +435,31 @@ class ChatLLM:
 
             generation = generation.after_character(response, character.id)
 
+    def determine_next_character(self, generation: Generation) -> Optional[Character]:
+        """Decide who speaks next.
+
+        1. Parse last message for a character mention.
+        2. Check loop deterrent â€” has this pair already fired this turn?
+        3. User turn with no mention â†’ default to first character.
+        4. Character turn with no mention â†’ cycle ends.
+        """
+        mentioned = self.parse_last_message(
+            text=generation.last_message,
+            active_characters=self.active_characters,
+            exclude_id=generation.last_responder_id,
+        )
+
+        if mentioned:
+            if generation.can_respond_to_last(mentioned.id):
+                return mentioned
+            return None  # blocked by loop deterrent
+
+        # user spoke but didn't mention anyone  default character
+        if generation.is_user_turn and self.active_characters:
+            return self.active_characters[0]
+
+        return None
+    
     def parse_last_message(
         self,
         text: str,
@@ -461,31 +486,6 @@ class ChatLLM:
             for pattern in patterns:
                 if re.search(rf"\b{pattern}\b", text_lower):
                     return character
-
-        return None
-
-    def determine_next_character(self, generation: Generation) -> Optional[Character]:
-        """Decide who speaks next.
-
-        1. Parse last message for a character mention.
-        2. Check loop deterrent â€” has this pair already fired this turn?
-        3. User turn with no mention â†’ default to first character.
-        4. Character turn with no mention â†’ cycle ends.
-        """
-        mentioned = self.parse_last_message(
-            text=generation.last_message,
-            active_characters=self.active_characters,
-            exclude_id=generation.last_responder_id,
-        )
-
-        if mentioned:
-            if generation.can_respond_to_last(mentioned.id):
-                return mentioned
-            return None  # blocked by loop deterrent
-
-        # user spoke but didn't mention anyone  default character
-        if generation.is_user_turn and self.active_characters:
-            return self.active_characters[0]
 
         return None
 
@@ -591,8 +591,8 @@ class ChatLLM:
                 minimum_sentence_length=25,
                 tokenizer="nltk",
                 quick_yield_single_sentence_fragment=True,
-                sentence_fragment_delimiters=".?!;:,\nâ€¦)]}ã€‚-",
-                full_sentence_delimiters=".?!\nâ€¦ã€‚",
+                sentence_fragment_delimiters = ".?!;:,…)]}。-",
+                full_sentence_delimiters = ".?!…。",
             ):
                 sentence_text = sentence.strip()
                 if sentence_text:
