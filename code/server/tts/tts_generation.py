@@ -1,20 +1,16 @@
 from __future__ import annotations
-
+import os
+import torch
 import asyncio
 import logging
-import os
+import numpy as np
 from dataclasses import dataclass
 from typing import Callable, Optional, Dict, List, AsyncGenerator, Protocol
-
-import numpy as np
-import torch
-
 from server.database import db, Voice
 from server.tts.boson_multimodal.serve.serve_engine import HiggsAudioServeEngine
-from server.tts.boson_multimodal.data_types import ChatMLSample, Message, AudioContent
+from server.tts.boson_multimodal.data_types import ChatMLSample, Message, AudioContent, TextContent
 
 logger = logging.getLogger(__name__)
-
 
 @dataclass
 class TTSSentence:
@@ -26,14 +22,12 @@ class TTSSentence:
     character_name: str
     voice_id: str
 
-
 @dataclass
 class AudioResponseDone:
     turn_id: str
     message_id: str
     character_id: str
     character_name: str
-
 
 @dataclass
 class AudioChunk:
@@ -45,11 +39,9 @@ class AudioChunk:
     character_id: str
     character_name: str
 
-
 class TTSQueues(Protocol):
     sentence_queue: asyncio.Queue
     tts_queue: asyncio.Queue
-
 
 def revert_delay_pattern(data: torch.Tensor, start_idx: int = 0) -> torch.Tensor:
     """Undo Higgs delay pattern so decoded frames line up."""
@@ -63,7 +55,6 @@ def revert_delay_pattern(data: torch.Tensor, start_idx: int = 0) -> torch.Tensor
     for i in range(num_codebooks):
         out.append(data[i:(i + 1), i + start_idx:(data.shape[1] - num_codebooks + 1 + i)])
     return torch.cat(out, dim=0)
-
 
 class TTS:
     def __init__(self, queues: TTSQueues, is_turn_cancelled: Optional[Callable[[str], bool]] = None):
