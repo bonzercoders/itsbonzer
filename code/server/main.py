@@ -70,7 +70,6 @@ class TTSSentence:
 
 @dataclass
 class AudioResponseDone:
-    """Typed sentinel marking completion of one character response."""
     turn_id: str
     message_id: str
     character_id: str
@@ -1224,8 +1223,6 @@ class WebSocketManager:
             self.chat.active_characters = await self.chat.get_active_characters()
             logger.info(f"Refreshed to {len(self.chat.active_characters)} active characters")
 
-    # ------ Pipeline event callbacks ------ #
-
     async def on_transcription_update(self, text: str):
         await self.send_text_to_client({"type": "stt_update", "text": text})
 
@@ -1442,6 +1439,7 @@ class WebSocketManager:
         """Send JSON message to client."""
         if self.websocket:
             await self.websocket.send_text(json.dumps(data))
+
 ########################################
 ##--           FastAPI App          --##
 ########################################
@@ -1508,6 +1506,4 @@ async def websocket_endpoint(websocket: WebSocket):
 app.mount("/", StaticFiles(directory="client", html=True), name="client")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
+    uvicorn.run(app, host="0.0.0.0", port=5173)
