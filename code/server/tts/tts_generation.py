@@ -6,7 +6,7 @@ import logging
 import numpy as np
 from dataclasses import dataclass
 from typing import Callable, Optional, Dict, List, AsyncGenerator, Protocol
-from server.database import db, Voice
+from server.database.supabase import db, Voice
 from server.tts.boson_multimodal.serve.serve_engine import HiggsAudioServeEngine
 from server.tts.boson_multimodal.data_types import ChatMLSample, Message, AudioContent, TextContent
 
