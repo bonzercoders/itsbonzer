@@ -31,7 +31,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional, Dict, List, Union, Any, AsyncIterator, AsyncGenerator, Awaitable, Set, Tuple
-from server.database.supabase import db, Character, Conversation, MessageCreate
+from server.database.supabase import db, Character, Conversation, ConversationCreate, MessageCreate
 from server.stt import AudioToTextRecorder
 from server.stream2sentence import generate_sentences_async
 from server.tts.tts_generation import TTS, TTSSentence, AudioResponseDone, AudioChunk
@@ -313,6 +313,7 @@ class ChatLLM:
     async def clear_conversation_history(self):
         """Clear Conversation History"""
         self.conversation_history = []
+        self.conversation_id = None
 
     async def get_model_settings(self) -> ModelSettings:
         """Return current model settings, or sensible defaults."""
@@ -413,12 +414,25 @@ class ChatLLM:
 
         generation = Generation.from_user(user_message, turn_id=turn_id)
 
+        if self.conversation_id is None:
+            self.conversation_id = str(uuid.uuid4())
+            db.save_conversation_bg(ConversationCreate(
+                conversation_id=self.conversation_id,
+                active_characters=[{"id": c.id, "name": c.name} for c in self.active_characters],
+            ))
+
         # append user message exactly once
         self.conversation_history.append({
             "role": "user",
             "name": "Jay",
             "content": user_message,
         })
+        db.save_message_bg(MessageCreate(
+            conversation_id=self.conversation_id,
+            role="user",
+            name=self.user_name,
+            content=user_message,
+        ))
 
         while True:
             character = self.determine_next_character(generation)
@@ -434,6 +448,14 @@ class ChatLLM:
 
             if not response:
                 break
+
+            db.save_message_bg(MessageCreate(
+                conversation_id=self.conversation_id,
+                role="assistant",
+                name=character.name,
+                character_id=character.id,
+                content=response,
+            ))
 
             generation = generation.after_character(response, character.id)
 
@@ -690,6 +712,9 @@ class WebSocketManager:
         """Accept WebSocket connection, start pipeline and audio streamer."""
         await websocket.accept()
         self.websocket = websocket
+
+        if self.chat:
+            self.chat.conversation_id = None
 
         await self._conversation_tasks()
         await self.emit_stt_state()

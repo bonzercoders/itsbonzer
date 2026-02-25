@@ -107,6 +107,7 @@ class Conversation(BaseModel):
 
 
 class ConversationCreate(BaseModel):
+    conversation_id: Optional[str] = None
     title: Optional[str] = None
     active_characters: List[Dict[str, Any]] = []
 
@@ -777,6 +778,8 @@ class Database:
                 "title": title,
                 "active_characters": conversation_data.active_characters or []
             }
+            if conversation_data.conversation_id:
+                db_data["conversation_id"] = conversation_data.conversation_id
 
             response = await self.supabase.table("conversations")\
                 .insert(db_data)\
@@ -1234,6 +1237,29 @@ class Database:
         except Exception as e:
             logger.error(f"Error deleting messages for conversation {conversation_id}: {e}")
             raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+    ########################################
+    ##--    Background Task Helpers      --##
+    ########################################
+
+    def save_conversation_bg(self, data: ConversationCreate) -> None:
+        """Fire-and-forget: create a conversation without blocking the caller."""
+        async def _save():
+            try:
+                await self.create_conversation(data)
+            except Exception as e:
+                logger.error(f"[DB] Failed to save conversation: {e}")
+        asyncio.create_task(_save())
+
+    def save_message_bg(self, data: MessageCreate) -> None:
+        """Fire-and-forget: create a message without blocking the caller."""
+        async def _save():
+            try:
+                await self.create_message(data)
+            except Exception as e:
+                logger.error(f"[DB] Failed to save message: {e}")
+        asyncio.create_task(_save())
 
 
 ########################################
