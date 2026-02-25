@@ -50,7 +50,6 @@ export function MessageArea({ messages, characterMap, streamingRef }: MessageAre
       <div className="mx-auto max-w-[760px] pb-[300px] pt-4">
         {messages.length === 0 ? (
           <div className="flex items-center justify-center py-24 text-sm text-[#4b5563]">
-            Start a conversation...
           </div>
         ) : (
           messages.map((message) => (
