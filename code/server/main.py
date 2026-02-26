@@ -175,10 +175,10 @@ class STT:
             on_transcription_start=self._on_transcription_start,
             on_vad_detect_start=self._on_vad_detect_start,
             on_vad_detect_stop=self._on_vad_detect_stop,
-            silero_sensitivity=0.4,
+            silero_sensitivity=0.3,
             webrtc_sensitivity=3,
-            post_speech_silence_duration=0.7,
-            min_length_of_recording=0.5,
+            post_speech_silence_duration=0.9,
+            min_length_of_recording=1.5,
             spinner=False,
             level=logging.WARNING,
             use_microphone=False
